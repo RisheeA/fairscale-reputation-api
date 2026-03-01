@@ -1,5 +1,7 @@
 import express from 'express';
 import cors from 'cors';
+import nacl from 'tweetnacl';
+import bs58 from 'bs58';
 import 'dotenv/config';
 
 const app = express();
@@ -14,7 +16,6 @@ const CONFIG = {
   FAIRSCALE_API: 'https://api.fairscale.xyz',
   FAIRSCALE_API_KEY: process.env.FAIRSCALE_API_KEY,
   SAID_API: 'https://api.saidprotocol.com',
-  X402_COMMUNITY_API: 'https://x402-discovery-api.onrender.com',
   HELIUS_API_KEY: process.env.HELIUS_API_KEY || '',
   HELIUS_RPC: 'https://mainnet.helius-rpc.com',
   PAYMENT_ADDRESS: 'fairAUEuR1SCcHL254Vb3F3XpUWLruJ2a11f6QfANEN',
@@ -24,36 +25,22 @@ const CONFIG = {
 };
 
 // =============================================================================
-// AGENT SCORING THRESHOLDS
-// Optimized for AI agents - shorter timeframes, higher activity expectations
-// 
-// PERCENTILE FIELDS (0-1 scale, already normalized by FairScale):
-//   - major_percentile_score
-//   - stable_percentile_score
-//   - lst_percentile_score
-//   - native_sol_percentile
-//
-// RAW FIELDS (absolute values we normalize ourselves):
-//   - wallet_age_days
-//   - active_days
-//   - tx_count
-//   - platform_diversity
-//   - median_hold_days
-//   - conviction_ratio (0-1)
-//   - no_instant_dumps (0-1)
+// LOGARITHMIC SCORING - Makes 100 very difficult to achieve
 // =============================================================================
 
-const AGENT_THRESHOLDS = {
-  // Longevity: 30 days = max score (agents are new, activity matters more)
-  WALLET_AGE_MAX_DAYS: 30,
-  
-  // Experience: Agents transact heavily
-  TX_COUNT_MAX: 100,           // 100 txs = 100%
-  PLATFORM_DIVERSITY_MAX: 5,   // 5 protocols = 100%
-  
-  // Conviction: Agents may trade more, 7 days holding is solid
-  MEDIAN_HOLD_DAYS_MAX: 7,
-};
+function logScale(value, max, curve = 2) {
+  // Logarithmic scaling: easy to get to 50, hard to get to 80, very hard to get to 100
+  // curve controls steepness (higher = harder to reach top)
+  const normalized = Math.min(value / max, 1);
+  const scaled = Math.pow(normalized, 1 / curve) * 100;
+  return Math.min(Math.round(scaled), 99); // Cap at 99, 100 requires exceptional metrics
+}
+
+function logScaleInverse(value, max, curve = 2) {
+  // For percentiles that are already 0-1
+  const scaled = Math.pow(value, 1 / curve) * 100;
+  return Math.min(Math.round(scaled), 99);
+}
 
 // =============================================================================
 // IN-MEMORY REGISTRY
@@ -61,31 +48,11 @@ const AGENT_THRESHOLDS = {
 
 const REGISTRY = {
   agents: new Map(),
-  registeredAgents: new Map(),  // Agents who registered themselves
-  services: new Map(),
+  registeredAgents: new Map(),
+  services: new Map(),        // x402 services registered by agents
   verifiedWallets: new Map(),
+  challenges: new Map(),      // For signature verification
   lastSync: null
-};
-
-// =============================================================================
-// BADGE DEFINITIONS
-// =============================================================================
-
-const BADGE_DEFINITIONS = {
-  established: { label: 'Established', description: 'Active for 30+ days' },
-  active: { label: 'Active', description: 'High transaction frequency' },
-  committed: { label: 'Committed', description: 'Consistent holding behavior' },
-  capitalised: { label: 'Capitalised', description: 'Above-average holdings' },
-  diverse: { label: 'Diverse', description: 'Multi-protocol usage' },
-  experienced: { label: 'Experienced', description: '100+ transactions' },
-  diamond_hands: { label: 'Diamond Hands', description: 'Long-term holder' },
-  attested: { label: 'Attested', description: 'Has attestations on SAID' },
-  trusted_by_many: { label: 'Trusted', description: '5+ attestations' },
-  said_verified: { label: 'SAID Verified', description: 'Verified identity' },
-  said_trusted: { label: 'High Trust', description: 'High trust tier' },
-  mcp_available: { label: 'MCP', description: 'Has MCP endpoint' },
-  registered: { label: 'Registered', description: 'Self-registered agent' },
-  fairscale_verified: { label: 'FS Verified', description: 'Paid verification' }
 };
 
 // =============================================================================
@@ -120,20 +87,24 @@ async function getSAIDData(wallet) {
   }
 }
 
-async function getX402SolanaServices() {
+// =============================================================================
+// SIGNATURE VERIFICATION
+// =============================================================================
+
+function generateChallenge(wallet) {
+  const challenge = `fairscale:${wallet}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  REGISTRY.challenges.set(wallet, { challenge, expires: Date.now() + 300000 }); // 5 min
+  return challenge;
+}
+
+function verifySignature(wallet, signature, message) {
   try {
-    const response = await fetch(`${CONFIG.X402_COMMUNITY_API}/services`, {
-      headers: { 'accept': 'application/json' }
-    });
-    if (!response.ok) return [];
-    const services = await response.json();
-    // Filter to Solana-only services
-    return (services || []).filter(s => {
-      const network = (s.network || s.pricing?.network || '').toLowerCase();
-      return network.includes('solana') || network.includes('sol') || network === '';
-    });
+    const publicKey = bs58.decode(wallet);
+    const signatureBytes = bs58.decode(signature);
+    const messageBytes = new TextEncoder().encode(message);
+    return nacl.sign.detached.verify(messageBytes, signatureBytes, publicKey);
   } catch (e) {
-    return [];
+    return false;
   }
 }
 
@@ -201,201 +172,149 @@ async function verifyPayment(senderWallet) {
 }
 
 // =============================================================================
-// AGENT SCORE CALCULATIONS
+// AGENT SCORE CALCULATIONS - LOGARITHMIC SCALING
 // =============================================================================
 
 function calculateAgentFeatures(fairscaleData) {
   const f = fairscaleData?.features || {};
-  const T = AGENT_THRESHOLDS;
   
-  // ==========================================================================
-  // LONGEVITY
-  // - wallet_age_days: RAW value, we normalize to 30 days = 100%
-  // - active_days: RAW value
-  // - Activity RATIO is key for agents (consistency > raw age)
-  // ==========================================================================
-  
+  // Raw values
   const walletAgeDays = f.wallet_age_days || 0;
   const activeDays = f.active_days || 0;
-  
-  // Age score: 30 days = 100%
-  const ageScore = Math.min((walletAgeDays / T.WALLET_AGE_MAX_DAYS) * 100, 100);
-  
-  // Activity ratio: what % of days were they active?
-  // For agents, being active 50% of days is excellent
-  const activityRatio = walletAgeDays > 0 
-    ? Math.min((activeDays / walletAgeDays) * 200, 100) // 50% active = 100%
-    : 0;
-  
-  // Longevity: 30% age, 70% activity ratio (agents need consistency, not age)
-  const longevity = Math.round((ageScore * 0.3) + (activityRatio * 0.7));
-  
-  // ==========================================================================
-  // EXPERIENCE
-  // - tx_count: RAW value, normalize to 100 txs = 100%
-  // - platform_diversity: RAW value, 5 protocols = 100%
-  // ==========================================================================
-  
   const txCount = f.tx_count || 0;
   const platformDiversity = f.platform_diversity || 0;
+  const convictionRatio = f.conviction_ratio || 0;
+  const medianHoldDays = f.median_hold_days || 0;
+  const noInstantDumps = f.no_instant_dumps || 0;
+  const majorPercentile = f.major_percentile_score || 0;
+  const stablePercentile = f.stable_percentile_score || 0;
+  const lstPercentile = f.lst_percentile_score || 0;
+  const solPercentile = f.native_sol_percentile || 0;
   
-  const txScore = Math.min((txCount / T.TX_COUNT_MAX) * 100, 100);
-  const diversityScore = Math.min((platformDiversity / T.PLATFORM_DIVERSITY_MAX) * 100, 100);
+  // ==========================================================================
+  // LONGEVITY - "How consistently active is this wallet?"
+  // Threshold: 60 days with 50%+ activity ratio for top scores
+  // ==========================================================================
   
-  // Experience: 60% transactions, 40% diversity
+  const ageScore = logScale(walletAgeDays, 60, 2.5);
+  const activityRatio = walletAgeDays > 0 ? activeDays / walletAgeDays : 0;
+  const activityScore = logScaleInverse(activityRatio, 1, 2);
+  const longevity = Math.round((ageScore * 0.4) + (activityScore * 0.6));
+  
+  // ==========================================================================
+  // EXPERIENCE - "How much has this wallet done on-chain?"
+  // Threshold: 500 txs across 10 protocols for top scores
+  // ==========================================================================
+  
+  const txScore = logScale(txCount, 500, 3);
+  const diversityScore = logScale(platformDiversity, 10, 2);
   const experience = Math.round((txScore * 0.6) + (diversityScore * 0.4));
   
   // ==========================================================================
-  // CONVICTION
-  // - conviction_ratio: Already 0-1, multiply by 100
-  // - median_hold_days: RAW, 7 days = 100% for agents
-  // - no_instant_dumps: Already 0-1, multiply by 100
+  // STABILITY - "Does this wallet hold or dump?"
+  // Uses conviction ratio, hold time, and dump behavior
   // ==========================================================================
   
-  const convictionRatio = (f.conviction_ratio || 0) * 100;
-  const medianHoldDays = f.median_hold_days || 0;
-  const noInstantDumps = (f.no_instant_dumps || 0) * 100;
-  
-  const holdScore = Math.min((medianHoldDays / T.MEDIAN_HOLD_DAYS_MAX) * 100, 100);
-  
-  // Conviction: 40% ratio, 30% hold time, 30% no dumps
-  const conviction = Math.round((convictionRatio * 0.4) + (holdScore * 0.3) + (noInstantDumps * 0.3));
+  const convScore = logScaleInverse(convictionRatio, 1, 2);
+  const holdScore = logScale(medianHoldDays, 30, 2.5);
+  const dumpScore = logScaleInverse(noInstantDumps, 1, 1.5);
+  const stability = Math.round((convScore * 0.35) + (holdScore * 0.35) + (dumpScore * 0.3));
   
   // ==========================================================================
-  // CAPITAL
-  // - These are PERCENTILE scores (0-1), already normalized by FairScale
-  // - Just multiply by 100 to get 0-100 scale
+  // CAPITAL - "What's the wallet's holdings percentile?"
+  // Percentiles are already relative, apply log curve
   // ==========================================================================
   
-  const majorPercentile = (f.major_percentile_score || 0) * 100;
-  const stablePercentile = (f.stable_percentile_score || 0) * 100;
-  const lstPercentile = (f.lst_percentile_score || 0) * 100;
-  const solPercentile = (f.native_sol_percentile || 0) * 100;
-  
-  // Capital: weighted average of percentiles
-  const capital = Math.round(
-    (majorPercentile * 0.3) + 
-    (stablePercentile * 0.3) + 
-    (lstPercentile * 0.2) + 
-    (solPercentile * 0.2)
-  );
+  const majorScore = logScaleInverse(majorPercentile, 1, 2.5);
+  const stableScore = logScaleInverse(stablePercentile, 1, 2.5);
+  const lstScore = logScaleInverse(lstPercentile, 1, 2.5);
+  const solScore = logScaleInverse(solPercentile, 1, 2.5);
+  const capital = Math.round((majorScore * 0.3) + (stableScore * 0.3) + (lstScore * 0.2) + (solScore * 0.2));
   
   // ==========================================================================
-  // FALLBACK: If features are all 0 but FairScale gave a score
+  // FALLBACK
   // ==========================================================================
   
   const allZero = walletAgeDays === 0 && txCount === 0 && activeDays === 0;
   
   if (allZero && fairscaleData) {
     const fsBase = fairscaleData.fairscore_base || fairscaleData.fairscore || 0;
-    const fsTier = fairscaleData.tier;
-    const tierBonus = fsTier === 'gold' ? 15 : fsTier === 'silver' ? 8 : 0;
-    
-    // Derive from their score with variance
+    const scaled = logScale(fsBase, 100, 1.5);
     return {
-      longevity: Math.min(Math.round(fsBase * 0.85 + tierBonus + Math.random() * 5), 100),
-      experience: Math.min(Math.round(fsBase * 0.95 + tierBonus + Math.random() * 5), 100),
-      conviction: Math.min(Math.round(fsBase * 0.90 + tierBonus + Math.random() * 5), 100),
-      capital: Math.min(Math.round(fsBase * 0.80 + tierBonus + Math.random() * 5), 100),
+      longevity: Math.round(scaled * 0.8),
+      experience: Math.round(scaled * 0.9),
+      stability: Math.round(scaled * 0.85),
+      capital: Math.round(scaled * 0.75),
       _fallback: true
     };
   }
   
+  // Bonus for exceptional metrics - only way to hit 100
+  const bonus = (walletAgeDays > 180 && txCount > 1000 && activityRatio > 0.7) ? 1 : 0;
+  
   return {
-    longevity: Math.min(Math.max(longevity, 0), 100),
-    experience: Math.min(Math.max(experience, 0), 100),
-    conviction: Math.min(Math.max(conviction, 0), 100),
-    capital: Math.min(Math.max(capital, 0), 100),
+    longevity: Math.min(longevity + bonus, 100),
+    experience: Math.min(experience + bonus, 100),
+    stability: Math.min(stability + bonus, 100),
+    capital: Math.min(capital + bonus, 100),
     _fallback: false
   };
 }
 
-function calculateBadges(fairscaleData, saidData, wallet) {
-  const f = fairscaleData?.features || {};
-  const badges = [];
+function calculateAgentFairScore(fairscaleData, features, saidData, wallet) {
+  // FairScale base (45%)
+  const fsBase = fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0;
+  const fsScore = logScale(fsBase, 100, 1.5) * 0.45;
   
-  // Pass through FairScale badges
-  for (const b of (fairscaleData?.badges || [])) {
-    if (b.id && !badges.find(x => x.id === b.id)) {
-      badges.push({ 
-        id: b.id, 
-        label: BADGE_DEFINITIONS[b.id]?.label || b.label || b.id, 
-        description: b.description || '',
-        tier: b.tier 
-      });
-    }
-  }
+  // Features (35%)
+  const featureAvg = (features.longevity + features.experience + features.stability + features.capital) / 4;
+  const featureScore = featureAvg * 0.35;
   
-  // Feature-based badges (agent thresholds)
-  if ((f.wallet_age_days || 0) >= 30 && !badges.find(b => b.id === 'established')) {
-    badges.push({ ...BADGE_DEFINITIONS.established, id: 'established' });
-  }
-  if ((f.tx_count || 0) >= 100 && !badges.find(b => b.id === 'experienced')) {
-    badges.push({ ...BADGE_DEFINITIONS.experienced, id: 'experienced' });
-  }
-  if ((f.active_days || 0) >= 14 && !badges.find(b => b.id === 'active')) {
-    badges.push({ ...BADGE_DEFINITIONS.active, id: 'active' });
-  }
-  if ((f.platform_diversity || 0) >= 3 && !badges.find(b => b.id === 'diverse')) {
-    badges.push({ ...BADGE_DEFINITIONS.diverse, id: 'diverse' });
-  }
-  if ((f.conviction_ratio || 0) >= 0.4 && !badges.find(b => b.id === 'committed')) {
-    badges.push({ ...BADGE_DEFINITIONS.committed, id: 'committed' });
-  }
-  if (((f.major_percentile_score || 0) >= 0.3 || (f.stable_percentile_score || 0) >= 0.3) && !badges.find(b => b.id === 'capitalised')) {
-    badges.push({ ...BADGE_DEFINITIONS.capitalised, id: 'capitalised' });
-  }
+  // SAID (10%)
+  const saidScore = (saidData?.reputation?.score || 0) * 0.10;
   
-  // SAID badges
-  const feedbackCount = saidData?.reputation?.feedbackCount || 0;
-  if (feedbackCount >= 1) badges.push({ ...BADGE_DEFINITIONS.attested, id: 'attested' });
-  if (feedbackCount >= 5) badges.push({ ...BADGE_DEFINITIONS.trusted_by_many, id: 'trusted_by_many' });
-  if (saidData?.verified) badges.push({ ...BADGE_DEFINITIONS.said_verified, id: 'said_verified' });
-  if (saidData?.reputation?.trustTier === 'high') badges.push({ ...BADGE_DEFINITIONS.said_trusted, id: 'said_trusted' });
-  if (saidData?.endpoints?.mcp) badges.push({ ...BADGE_DEFINITIONS.mcp_available, id: 'mcp_available' });
+  // Bonuses (up to 10%)
+  let bonuses = 0;
+  if (saidData?.verified) bonuses += 2;
+  if (saidData?.reputation?.trustTier === 'high') bonuses += 2;
+  bonuses += Math.min((saidData?.reputation?.feedbackCount || 0), 4);
+  if (REGISTRY.registeredAgents.has(wallet)) bonuses += 1;
+  if (REGISTRY.verifiedWallets.has(wallet)) bonuses += 8;
   
-  // Registry badges
-  if (REGISTRY.registeredAgents.has(wallet)) {
-    badges.push({ ...BADGE_DEFINITIONS.registered, id: 'registered' });
-  }
-  if (REGISTRY.verifiedWallets.has(wallet)) {
-    badges.push({ ...BADGE_DEFINITIONS.fairscale_verified, id: 'fairscale_verified' });
-  }
-  
-  return badges;
+  const total = fsScore + featureScore + saidScore + Math.min(bonuses, 10);
+  return Math.min(Math.round(total), 100);
 }
 
-function calculateAgentFairScore(fairscaleData, features, saidData, wallet) {
-  let score = 0;
+// =============================================================================
+// FEATURE DESCRIPTIONS - Technical but readable
+// =============================================================================
+
+function getFeatureDescription(feature, value) {
+  const descriptions = {
+    longevity: {
+      high: 'Active 50%+ of wallet lifetime, consistent on-chain presence',
+      mid: 'Regular activity pattern, some gaps in usage',
+      low: 'Sporadic activity or recently created wallet'
+    },
+    experience: {
+      high: '500+ transactions across 8+ protocols',
+      mid: '100-500 transactions, uses multiple protocols',
+      low: 'Under 100 transactions, limited protocol usage'
+    },
+    stability: {
+      high: 'Holds positions 14+ days, rarely sells within 24h of receiving',
+      mid: 'Mixed behavior, some quick sells but also holds',
+      low: 'Frequently sells within hours of receiving tokens'
+    },
+    capital: {
+      high: 'Top 20% holdings in major tokens and stables',
+      mid: 'Average holdings relative to network',
+      low: 'Below average token holdings'
+    }
+  };
   
-  // 1. FairScale base (40%)
-  const fsScore = fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0;
-  score += fsScore * 0.40;
-  
-  // 2. Agent features (35%)
-  const featureAvg = (features.longevity + features.experience + features.conviction + features.capital) / 4;
-  score += featureAvg * 0.35;
-  
-  // 3. SAID (15%)
-  const saidScore = saidData?.reputation?.score || 0;
-  score += saidScore * 0.15;
-  
-  // 4. Bonuses (up to +15)
-  let bonuses = 0;
-  
-  if (saidData?.verified) bonuses += 3;
-  if (saidData?.reputation?.trustTier === 'high') bonuses += 3;
-  bonuses += Math.min((saidData?.reputation?.feedbackCount || 0) * 1.5, 6);
-  
-  if (fairscaleData?.tier === 'gold') bonuses += 2;
-  else if (fairscaleData?.tier === 'silver') bonuses += 1;
-  
-  if (REGISTRY.registeredAgents.has(wallet)) bonuses += 2;
-  if (REGISTRY.verifiedWallets.has(wallet)) bonuses += 10;
-  
-  score += Math.min(bonuses, 15);
-  
-  return Math.min(Math.round(score), 100);
+  const tier = value >= 65 ? 'high' : value >= 35 ? 'mid' : 'low';
+  return descriptions[feature]?.[tier] || '';
 }
 
 // =============================================================================
@@ -418,87 +337,42 @@ async function getOrCreateAgent(wallet) {
   if (!fairscaleData && !saidData) return null;
   
   const features = calculateAgentFeatures(fairscaleData);
-  const badges = calculateBadges(fairscaleData, saidData, wallet);
   const agentFairScore = calculateAgentFairScore(fairscaleData, features, saidData, wallet);
-  
-  // Get registration data if exists
   const regData = REGISTRY.registeredAgents.get(wallet);
   
   const agent = {
     wallet,
     name: regData?.name || saidData?.identity?.name || null,
     description: regData?.description || saidData?.identity?.description || null,
-    social: {
-      twitter: saidData?.identity?.twitter || null,
-      website: regData?.website || saidData?.identity?.website || null
-    },
-    endpoints: {
-      mcp: regData?.mcp || saidData?.endpoints?.mcp || null,
-      a2a: saidData?.endpoints?.a2a || null
-    },
-    skills: regData?.skills || saidData?.skills || [],
+    website: regData?.website || saidData?.identity?.website || null,
+    mcp: regData?.mcp || saidData?.endpoints?.mcp || null,
     scores: {
       agent_fairscore: agentFairScore,
-      fairscore_base: Math.round(fairscaleData?.fairscore_base || fairscaleData?.fairscore || 0),
+      fairscore_base: Math.round(fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0),
       said_score: saidData?.reputation?.score || null,
       said_trust_tier: saidData?.reputation?.trustTier || null,
-      attestations: saidData?.reputation?.feedbackCount || 0,
-      tier: fairscaleData?.tier || null
+      attestations: saidData?.reputation?.feedbackCount || 0
     },
     features: {
       longevity: features.longevity,
       experience: features.experience,
-      conviction: features.conviction,
+      stability: features.stability,
       capital: features.capital
     },
-    badges,
-    sources: [],
+    descriptions: {
+      longevity: getFeatureDescription('longevity', features.longevity),
+      experience: getFeatureDescription('experience', features.experience),
+      stability: getFeatureDescription('stability', features.stability),
+      capital: getFeatureDescription('capital', features.capital)
+    },
     isRegistered: REGISTRY.registeredAgents.has(wallet),
     isVerified: REGISTRY.verifiedWallets.has(wallet),
+    services: Array.from(REGISTRY.services.values()).filter(s => s.wallet === wallet),
     lastUpdated: new Date().toISOString()
   };
   
-  if (fairscaleData) agent.sources.push('fairscale');
-  if (saidData?.registered) agent.sources.push('said');
-  if (regData) agent.sources.push('registry');
-  
   REGISTRY.agents.set(wallet, agent);
   return agent;
-}
-
-// =============================================================================
-// SERVICES SYNC (Solana only)
-// =============================================================================
-
-async function syncServices() {
-  const services = await getX402SolanaServices();
-  let added = 0;
-  
-  for (const svc of services) {
-    const id = `sol_${Math.random().toString(36).substr(2, 9)}`;
-    const resource = svc.url || svc.resource || svc.endpoint;
-    
-    if (!resource || Array.from(REGISTRY.services.values()).find(s => s.resource === resource)) continue;
-    
-    REGISTRY.services.set(id, {
-      id,
-      source: 'x402_solana',
-      resource,
-      name: svc.name || 'Solana Service',
-      description: svc.description || 'x402 Solana endpoint',
-      category: svc.category || 'utility',
-      pricing: {
-        price: svc.price_usd ? `$${svc.price_usd}` : svc.price || 'Contact',
-        raw: svc.price_usd || svc.price
-      },
-      network: 'solana',
-      discoveredAt: new Date().toISOString()
-    });
-    added++;
-  }
-  
-  REGISTRY.lastSync = new Date().toISOString();
-  return { added, total: REGISTRY.services.size };
 }
 
 // =============================================================================
@@ -508,19 +382,28 @@ async function syncServices() {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '8.0.0',
-    description: 'Agent reputation scoring for Solana',
+    version: '9.0.0',
     endpoints: {
-      'GET /score?wallet=': 'Get agent reputation score',
-      'POST /register': 'Register your agent',
-      'POST /verify': 'Verify payment for score boost',
-      'GET /directory': 'List registered agents',
-      'GET /services': 'Solana x402 services'
+      'GET /score': 'Get agent score',
+      'POST /register': 'Register agent (requires signature)',
+      'POST /verify': 'Verify payment',
+      'GET /challenge': 'Get signing challenge',
+      'POST /service': 'Register x402 service (requires signature)',
+      'GET /services': 'List services',
+      'GET /directory': 'List agents'
     }
   });
 });
 
-// Check agent score
+// Get signing challenge
+app.get('/challenge', (req, res) => {
+  const { wallet } = req.query;
+  if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
+  const challenge = generateChallenge(wallet);
+  res.json({ challenge, expiresIn: 300 });
+});
+
+// Get agent score
 app.get('/score', async (req, res) => {
   const { wallet } = req.query;
   if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
@@ -532,59 +415,101 @@ app.get('/score', async (req, res) => {
     wallet,
     name: agent.name || `Agent ${wallet.slice(0, 8)}...`,
     description: agent.description,
+    website: agent.website,
+    mcp: agent.mcp,
     agent_fairscore: agent.scores.agent_fairscore,
     fairscore_base: agent.scores.fairscore_base,
-    tier: agent.scores.tier,
     features: agent.features,
-    badges: agent.badges,
+    descriptions: agent.descriptions,
     said: {
-      registered: agent.sources.includes('said'),
-      verified: agent.badges.some(b => b.id === 'said_verified'),
       score: agent.scores.said_score,
       trustTier: agent.scores.said_trust_tier,
       feedbackCount: agent.scores.attestations
     },
-    social: agent.social,
-    endpoints: agent.endpoints,
-    skills: agent.skills,
     isRegistered: agent.isRegistered,
     isVerified: agent.isVerified,
-    sources: agent.sources
+    services: agent.services
   });
 });
 
-// Register agent
+// Register agent (requires signature)
 app.post('/register', async (req, res) => {
-  const { wallet, name, description, website, mcp, skills } = req.body;
+  const { wallet, signature, challenge, name, description, website, mcp } = req.body;
   
   if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
   
-  // Store registration
+  // If signature provided, verify it
+  if (signature && challenge) {
+    const stored = REGISTRY.challenges.get(wallet);
+    if (!stored || stored.challenge !== challenge || Date.now() > stored.expires) {
+      return res.status(400).json({ error: 'Invalid or expired challenge' });
+    }
+    if (!verifySignature(wallet, signature, challenge)) {
+      return res.status(400).json({ error: 'Invalid signature' });
+    }
+    REGISTRY.challenges.delete(wallet);
+  }
+  
   REGISTRY.registeredAgents.set(wallet, {
-    wallet,
-    name: name || null,
-    description: description || null,
-    website: website || null,
-    mcp: mcp || null,
-    skills: skills || [],
-    registeredAt: new Date().toISOString()
+    wallet, name, description, website, mcp,
+    registeredAt: new Date().toISOString(),
+    verified: !!signature
   });
   
-  // Clear cache to recalculate
   REGISTRY.agents.delete(wallet);
-  
-  // Return updated score
   const agent = await getOrCreateAgent(wallet);
   
   res.json({
     success: true,
-    message: 'Agent registered! +2 score bonus applied.',
+    message: signature ? 'Registered with signature verification' : 'Registered (unverified)',
     agent: agent ? {
       wallet,
       name: agent.name,
-      agent_fairscore: agent.scores.agent_fairscore,
-      badges: agent.badges
+      agent_fairscore: agent.scores.agent_fairscore
     } : null
+  });
+});
+
+// Register x402 service (requires signature)
+app.post('/service', async (req, res) => {
+  const { wallet, signature, challenge, url, name, description, price, category } = req.body;
+  
+  if (!wallet || !url || !name) {
+    return res.status(400).json({ error: 'Missing wallet, url, or name' });
+  }
+  
+  // Require signature for service registration
+  if (!signature || !challenge) {
+    return res.status(400).json({ error: 'Signature required. Get challenge from /challenge first.' });
+  }
+  
+  const stored = REGISTRY.challenges.get(wallet);
+  if (!stored || stored.challenge !== challenge || Date.now() > stored.expires) {
+    return res.status(400).json({ error: 'Invalid or expired challenge' });
+  }
+  if (!verifySignature(wallet, signature, challenge)) {
+    return res.status(400).json({ error: 'Invalid signature' });
+  }
+  REGISTRY.challenges.delete(wallet);
+  
+  const serviceId = `svc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  
+  REGISTRY.services.set(serviceId, {
+    id: serviceId,
+    wallet,
+    url,
+    name,
+    description: description || '',
+    price: price || 'Contact',
+    category: category || 'utility',
+    network: 'solana',
+    registeredAt: new Date().toISOString()
+  });
+  
+  res.json({
+    success: true,
+    serviceId,
+    message: 'Service registered'
   });
 });
 
@@ -605,52 +530,42 @@ app.post('/verify', async (req, res) => {
       txSignature: result.txSignature
     });
     REGISTRY.agents.delete(wallet);
-    return res.json({ success: true, message: '+10 score boost applied', txSignature: result.txSignature });
+    return res.json({ success: true, message: '+8 score boost applied', txSignature: result.txSignature });
   }
   
   res.status(400).json({ success: false, error: result.error, paymentAddress: CONFIG.PAYMENT_ADDRESS });
 });
 
-// Directory of registered agents
-app.get('/directory', (req, res) => {
-  const agents = Array.from(REGISTRY.agents.values())
-    .filter(a => a.isRegistered || a.sources.includes('said'))
-    .sort((a, b) => b.scores.agent_fairscore - a.scores.agent_fairscore)
-    .slice(0, 100);
-  
-  res.json({
-    total: agents.length,
-    agents: agents.map(a => ({
-      wallet: a.wallet,
-      name: a.name || `Agent ${a.wallet.slice(0, 8)}...`,
-      agent_fairscore: a.scores.agent_fairscore,
-      badges: a.badges.map(b => b.id),
-      isVerified: a.isVerified
-    }))
-  });
-});
-
-// Solana services
-app.get('/services', async (req, res) => {
-  if (REGISTRY.services.size === 0) await syncServices();
-  
+// List services
+app.get('/services', (req, res) => {
   const services = Array.from(REGISTRY.services.values());
   res.json({ total: services.length, network: 'solana', services });
 });
 
-app.post('/sync', async (req, res) => {
-  const result = await syncServices();
-  res.json({ success: true, ...result });
+// Directory
+app.get('/directory', (req, res) => {
+  const agents = Array.from(REGISTRY.agents.values())
+    .filter(a => a.isRegistered)
+    .sort((a, b) => b.scores.agent_fairscore - a.scores.agent_fairscore)
+    .slice(0, 100)
+    .map(a => ({
+      wallet: a.wallet,
+      name: a.name || `Agent ${a.wallet.slice(0, 8)}...`,
+      agent_fairscore: a.scores.agent_fairscore,
+      isVerified: a.isVerified,
+      services: a.services.length
+    }));
+  
+  res.json({ total: agents.length, agents });
 });
 
+// Stats
 app.get('/stats', (req, res) => {
-  const agents = Array.from(REGISTRY.agents.values());
   res.json({
-    totalAgents: agents.length,
-    registeredAgents: REGISTRY.registeredAgents.size,
-    verifiedAgents: REGISTRY.verifiedWallets.size,
-    services: REGISTRY.services.size,
-    avgScore: agents.length ? Math.round(agents.reduce((s, a) => s + a.scores.agent_fairscore, 0) / agents.length) : 0
+    agents: REGISTRY.agents.size,
+    registered: REGISTRY.registeredAgents.size,
+    verified: REGISTRY.verifiedWallets.size,
+    services: REGISTRY.services.size
   });
 });
 
@@ -659,6 +574,5 @@ app.get('/stats', (req, res) => {
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Agent Registry v8 on port ${CONFIG.PORT}`);
-  syncServices();
+  console.log(`FairScale Registry v9 on port ${CONFIG.PORT}`);
 });
