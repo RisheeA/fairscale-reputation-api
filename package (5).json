@@ -1,0 +1,15 @@
+{
+  "name": "fairscale-reputation-api",
+  "version": "4.0.0",
+  "description": "Reputation scoring API combining FairScale + SAID",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2"
+  }
+}

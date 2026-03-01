@@ -1,0 +1,5 @@
+# FairScale API key (required)
+FAIRSCALE_API_KEY=your_key_here
+
+# Port (optional, defaults to 3000)
+PORT=3000
