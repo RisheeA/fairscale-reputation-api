@@ -67,19 +67,19 @@ async function getSAIDScore(wallet) {
 function calculateFeatures(data) {
   const f = data.features || {};
   
-  // Longevity: Age + Active days
-  const ageScore = Math.min((f.wallet_age_days || 0) / 365, 1);
-  const activeScore = Math.min((f.active_days || 0) / 180, 1);
+  // Longevity: Age + Active days (agent-friendly: 30 days = max)
+  const ageScore = Math.min((f.wallet_age_days || 0) / 30, 1);
+  const activeScore = Math.min((f.active_days || 0) / 14, 1);
   const longevity = Math.round(((ageScore * 0.5) + (activeScore * 0.5)) * 100);
   
-  // Experience: Transaction count + Platform diversity
-  const txScore = Math.min((f.tx_count || 0) / 500, 1);
+  // Experience: Transaction count + Platform diversity (agent-friendly: 50 txs = max)
+  const txScore = Math.min((f.tx_count || 0) / 50, 1);
   const diversityScore = f.platform_diversity || 0;
   const experience = Math.round(((txScore * 0.5) + (diversityScore * 0.5)) * 100);
   
   // Conviction: Conviction ratio + Hold days + No dumps
   const convictionRatio = f.conviction_ratio || 0;
-  const holdScore = Math.min((f.median_hold_days || 0) / 30, 1);
+  const holdScore = Math.min((f.median_hold_days || 0) / 7, 1);
   const noDumps = f.no_instant_dumps || 0;
   const conviction = Math.round(((convictionRatio * 0.4) + (holdScore * 0.3) + (noDumps * 0.3)) * 100);
   
@@ -186,20 +186,27 @@ function calculateTrustScores(features, saidScore) {
   };
 }
 
-function calculateAgentScore(features, socialCombined, saidScore) {
-  const said = saidScore || 0;
-  const social = socialCombined || 0;
-  
-  const score = Math.round(
-    (features.longevity * 0.20) +
-    (features.experience * 0.20) +
+function calculateAgentScore(features, socialCombined, saidScore, saidVerified) {
+  // FairScale component (60%)
+  const fairscaleScore = (
+    (features.longevity * 0.25) +
+    (features.experience * 0.25) +
     (features.conviction * 0.25) +
-    (features.capital * 0.15) +
-    (social * 0.10) +
-    (said * 0.10)
+    (features.capital * 0.25)
   );
   
-  return Math.min(score, 100);
+  // SAID component (40%)
+  const said = saidScore || 0;
+  
+  // Base score: 60% FairScale, 40% SAID
+  let score = (fairscaleScore * 0.60) + (said * 0.40);
+  
+  // SAID verified bonus: +10 points
+  if (saidVerified) {
+    score += 10;
+  }
+  
+  return Math.min(Math.round(score), 100);
 }
 
 function calculateSocialCombined(fairscaleSocial, saidData) {
@@ -262,7 +269,7 @@ app.get('/score', async (req, res) => {
   const socialCombined = calculateSocialCombined(fairscaleData.social_score, saidData);
   
   // Calculate agent score
-  const agentScore = calculateAgentScore(features, socialCombined, saidScore);
+  const agentScore = calculateAgentScore(features, socialCombined, saidScore, saidData?.verified);
   
   // Calculate trust scores
   const trust = calculateTrustScores(features, saidScore);
@@ -331,7 +338,7 @@ app.get('/check', async (req, res) => {
   const socialCombined = calculateSocialCombined(fairscaleData.social_score, saidData);
   
   // Calculate agent score
-  const agentScore = calculateAgentScore(features, socialCombined, saidScore);
+  const agentScore = calculateAgentScore(features, socialCombined, saidScore, saidData?.verified);
   
   // Calculate trust scores
   const trust = calculateTrustScores(features, saidScore);
