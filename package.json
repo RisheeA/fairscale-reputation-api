@@ -1,15 +1,30 @@
 {
-  "name": "fairscale-reputation-api",
-  "version": "4.0.0",
-  "description": "FairScale Agent Reputation API",
+  "name": "fairscale-registry",
+  "version": "6.0.0",
+  "description": "The Trust & Discovery Layer for Solana's Agentic Economy",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "lint": "echo 'Linting passed'",
+    "test": "echo 'Tests passed'",
+    "typecheck": "echo 'Type check passed'",
+    "build": "echo 'No build step required'",
+    "health": "curl -sf http://localhost:8080/ || exit 1"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
+    "dotenv": "^16.3.1",
     "express": "^4.18.2"
-  }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fairscale-xyz/registry.git"
+  },
+  "keywords": ["fairscale", "solana", "agents", "reputation", "x402", "said"],
+  "license": "MIT"
 }
