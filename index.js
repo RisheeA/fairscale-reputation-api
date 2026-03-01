@@ -67,7 +67,9 @@ async function getFairScaleScore(wallet) {
       { headers: { 'accept': 'application/json', 'fairkey': CONFIG.FAIRSCALE_API_KEY } }
     );
     if (!response.ok) return null;
-    return await response.json();
+    const data = await response.json();
+    console.log('FairScale API response:', JSON.stringify(data).slice(0, 500));
+    return data;
   } catch (e) {
     console.error('FairScale API error:', e.message);
     return null;
@@ -81,7 +83,9 @@ async function getSAIDData(wallet) {
       { headers: { 'accept': 'application/json' } }
     );
     if (!response.ok) return null;
-    return await response.json();
+    const data = await response.json();
+    console.log('SAID API response:', JSON.stringify(data).slice(0, 500));
+    return data;
   } catch (e) {
     console.error('SAID API error:', e.message);
     return null;
@@ -95,7 +99,6 @@ async function getX402BazaarServices() {
     const data = await response.json();
     return data.items || [];
   } catch (e) {
-    console.error('x402 Bazaar error:', e.message);
     return [];
   }
 }
@@ -106,13 +109,12 @@ async function getX402CommunityServices() {
     if (!response.ok) return [];
     return await response.json();
   } catch (e) {
-    console.error('x402 Community error:', e.message);
     return [];
   }
 }
 
 // =============================================================================
-// PAYMENT VERIFICATION VIA HELIUS
+// PAYMENT VERIFICATION
 // =============================================================================
 
 async function verifyPayment(senderWallet) {
@@ -121,7 +123,6 @@ async function verifyPayment(senderWallet) {
   }
   
   try {
-    // Get recent transactions to payment address
     const sigResponse = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -136,7 +137,6 @@ async function verifyPayment(senderWallet) {
     const sigData = await sigResponse.json();
     const signatures = sigData.result || [];
     
-    // Check each transaction for USDC from sender
     for (const sig of signatures) {
       const txResponse = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
         method: 'POST',
@@ -153,7 +153,6 @@ async function verifyPayment(senderWallet) {
       const tx = txData.result;
       if (!tx || !tx.meta || tx.meta.err) continue;
       
-      // Check token balances
       const preBalances = tx.meta.preTokenBalances || [];
       const postBalances = tx.meta.postTokenBalances || [];
       
@@ -167,7 +166,6 @@ async function verifyPayment(senderWallet) {
         const diff = postAmount - preAmount;
         
         if (diff >= CONFIG.VERIFICATION_AMOUNT) {
-          // Check if sender wallet is in the transaction
           const accountKeys = tx.transaction?.message?.accountKeys || [];
           const senderInTx = accountKeys.some(k => {
             const key = typeof k === 'string' ? k : k.pubkey;
@@ -183,77 +181,130 @@ async function verifyPayment(senderWallet) {
     
     return { verified: false, error: 'No matching payment found. Send $5 USDC and try again.' };
   } catch (e) {
-    console.error('Payment verification error:', e);
     return { verified: false, error: e.message };
   }
 }
 
 // =============================================================================
-// SCORE CALCULATIONS - USING CORRECT FAIRSCALE API FIELDS
+// SCORE CALCULATIONS - USING FAIRSCALE SUBSCORES + SAID DATA
 // =============================================================================
 
-function calculateFeatures(fairscaleData) {
-  // FairScale API returns data.features with these fields:
-  // - major_percentile_score (0-1): percentile for major token holdings
-  // - stable_percentile_score (0-1): percentile for stablecoin holdings
-  // - lst_percentile_score (0-1): percentile for LST holdings
-  // - active_days: number of active days in analysis window
-  // - wallet_age_days: age of wallet in days
-  // - tx_count: transaction count
-  // - platform_diversity: number of unique protocols used
-  // - conviction_ratio: holding behavior metric
-  // - median_hold_days: median holding period
-  // - no_instant_dumps: boolean/ratio for dump behavior
+function calculateFeatures(fairscaleData, saidData) {
+  // Get all available data sources
+  const subscores = fairscaleData?.subscores || {};
+  const features = fairscaleData?.features || {};
+  const baseScore = fairscaleData?.fairscore || fairscaleData?.score || 0;
   
-  const f = fairscaleData.features || {};
+  // SAID data - THIS IS CRITICAL
+  const saidScore = saidData?.reputation?.score || 0; // 0-100
+  const feedbackCount = saidData?.reputation?.feedbackCount || 0;
+  const trustTier = saidData?.reputation?.trustTier || 'unknown';
+  const isVerified = saidData?.verified || false;
+  const isRegistered = saidData?.registered || false;
   
-  // LONGEVITY: Wallet age and activity consistency
-  const walletAgeDays = f.wallet_age_days || 0;
-  const ageScore = Math.min((walletAgeDays / 365) * 100, 100); // Max at 1 year
-  const activeDays = f.active_days || 0;
-  const activityRatio = walletAgeDays > 0 ? Math.min((activeDays / walletAgeDays) * 100, 100) : 0;
-  const longevity = Math.round((ageScore * 0.6) + (activityRatio * 0.4));
+  let longevity, experience, conviction, capital;
   
-  // EXPERIENCE: Transaction count and protocol diversity
-  const txCount = f.tx_count || 0;
-  const txScore = Math.min((txCount / 500) * 100, 100); // Max at 500 txs
-  const platformDiversity = f.platform_diversity || 0;
-  const diversityScore = Math.min(platformDiversity * 10, 100); // Max at 10 platforms
-  const experience = Math.round((txScore * 0.5) + (diversityScore * 0.5));
+  // Check if we have FairScale subscores
+  const hasSubscores = subscores.tempo !== undefined || subscores.ecosystem !== undefined || 
+                       subscores.conviction !== undefined || subscores.balance !== undefined;
   
-  // CONVICTION: Holding patterns
-  const convictionRatio = (f.conviction_ratio || 0) * 100;
-  const medianHold = Math.min((f.median_hold_days || 0) / 30 * 50, 50); // Max contribution at 30 days
-  const noDumps = f.no_instant_dumps ? (typeof f.no_instant_dumps === 'boolean' ? 100 : f.no_instant_dumps * 100) : 50;
-  const conviction = Math.round((convictionRatio * 0.4) + (medianHold * 0.3) + (noDumps * 0.3));
+  // Check if we have detailed features
+  const hasFeatures = features.wallet_age_days !== undefined || features.tx_count !== undefined;
   
-  // CAPITAL: Holdings percentiles
-  const majorPct = (f.major_percentile_score || 0) * 100;
-  const stablePct = (f.stable_percentile_score || 0) * 100;
-  const lstPct = (f.lst_percentile_score || 0) * 100;
-  const capital = Math.round((majorPct * 0.4) + (stablePct * 0.3) + (lstPct * 0.3));
+  if (hasSubscores) {
+    // Use subscores directly - they're 0-1 scale
+    longevity = Math.round((subscores.tempo || 0) * 100);
+    experience = Math.round((subscores.ecosystem || 0) * 100);
+    conviction = Math.round((subscores.conviction || 0) * 100);
+    capital = Math.round((subscores.balance || 0) * 100);
+  } else if (hasFeatures) {
+    const walletAgeDays = features.wallet_age_days || 0;
+    const ageScore = Math.min((walletAgeDays / 365) * 100, 100);
+    const activeDays = features.active_days || 0;
+    const activityRatio = walletAgeDays > 0 ? Math.min((activeDays / walletAgeDays) * 100, 100) : 0;
+    longevity = Math.round((ageScore * 0.6) + (activityRatio * 0.4));
+    
+    const txCount = features.tx_count || 0;
+    const txScore = Math.min((txCount / 500) * 100, 100);
+    const platformDiversity = features.platform_diversity || 0;
+    const diversityScore = Math.min(platformDiversity * 10, 100);
+    experience = Math.round((txScore * 0.5) + (diversityScore * 0.5));
+    
+    conviction = Math.round((features.conviction_ratio || 0.5) * 100);
+    
+    const majorPct = (features.major_percentile_score || 0) * 100;
+    const stablePct = (features.stable_percentile_score || 0) * 100;
+    capital = Math.round((majorPct * 0.6) + (stablePct * 0.4));
+  } else {
+    // FALLBACK: Derive features primarily from SAID data + base FairScale score
+    // This is the key fix - SAID score of 80 should produce meaningful features
+    
+    // Base from FairScale (if available)
+    const fsBase = baseScore * 0.4;
+    
+    // SAID contribution is MAJOR - a SAID score of 80 means the agent is established
+    const saidBase = saidScore * 0.6;
+    
+    // LONGEVITY: Verified agents on SAID have proven presence
+    // SAID score 80 + verified = ~70+ longevity
+    longevity = Math.round(
+      fsBase + 
+      saidBase + 
+      (isVerified ? 15 : 0) + 
+      (isRegistered ? 10 : 0) +
+      (feedbackCount * 3)
+    );
+    
+    // EXPERIENCE: Attestations = interactions = experience
+    // SAID score 80 + attestations = ~75+ experience
+    experience = Math.round(
+      fsBase + 
+      saidBase +
+      (feedbackCount * 8) + // Each attestation = 8 pts
+      (isVerified ? 10 : 0)
+    );
+    
+    // CONVICTION: High trust tier means reliable behavior
+    // SAID score 80 + high trust = ~80+ conviction  
+    conviction = Math.round(
+      fsBase + 
+      saidBase +
+      (trustTier === 'high' ? 20 : trustTier === 'medium' ? 10 : 0) +
+      (isVerified ? 10 : 0)
+    );
+    
+    // CAPITAL: Use combined signals
+    capital = Math.round(
+      fsBase + 
+      saidBase +
+      (isVerified ? 10 : 0) +
+      (trustTier === 'high' ? 10 : 0)
+    );
+  }
   
+  // Clamp all values to 0-100
   return {
-    longevity: Math.min(Math.max(longevity, 0), 100),
-    experience: Math.min(Math.max(experience, 0), 100),
-    conviction: Math.min(Math.max(conviction, 0), 100),
-    capital: Math.min(Math.max(capital, 0), 100)
+    longevity: Math.min(Math.max(Math.round(longevity), 0), 100),
+    experience: Math.min(Math.max(Math.round(experience), 0), 100),
+    conviction: Math.min(Math.max(Math.round(conviction), 0), 100),
+    capital: Math.min(Math.max(Math.round(capital), 0), 100)
   };
 }
 
 function calculateBadges(fairscaleData, saidData, wallet) {
-  const f = fairscaleData?.features || {};
+  const subscores = fairscaleData?.subscores || {};
+  const features = fairscaleData?.features || {};
+  const baseScore = fairscaleData?.fairscore || fairscaleData?.score || 0;
   const badges = [];
   
-  // Feature-based badges
-  if ((f.wallet_age_days || 0) >= 180) badges.push({ ...BADGE_DEFINITIONS.established, id: 'established' });
-  if ((f.conviction_ratio || 0) >= 0.6) badges.push({ ...BADGE_DEFINITIONS.committed, id: 'committed' });
-  if ((f.major_percentile_score || 0) >= 0.5) badges.push({ ...BADGE_DEFINITIONS.capitalised, id: 'capitalised' });
-  if ((f.platform_diversity || 0) >= 5) badges.push({ ...BADGE_DEFINITIONS.diverse, id: 'diverse' });
-  if ((f.tx_count || 0) >= 200) badges.push({ ...BADGE_DEFINITIONS.experienced, id: 'experienced' });
-  if ((f.median_hold_days || 0) >= 14) badges.push({ ...BADGE_DEFINITIONS.holder, id: 'holder' });
+  // Score-based badges
+  if (baseScore >= 60) badges.push({ ...BADGE_DEFINITIONS.established, id: 'established' });
+  if ((subscores.conviction || 0) >= 0.6 || baseScore >= 70) badges.push({ ...BADGE_DEFINITIONS.committed, id: 'committed' });
+  if ((subscores.balance || 0) >= 0.5 || baseScore >= 50) badges.push({ ...BADGE_DEFINITIONS.capitalised, id: 'capitalised' });
+  if ((subscores.ecosystem || 0) >= 0.5) badges.push({ ...BADGE_DEFINITIONS.diverse, id: 'diverse' });
+  if ((subscores.ecosystem || 0) >= 0.7 || baseScore >= 75) badges.push({ ...BADGE_DEFINITIONS.experienced, id: 'experienced' });
   
-  // SAID badges
+  // SAID badges - these are important!
   const feedbackCount = saidData?.reputation?.feedbackCount || 0;
   if (feedbackCount >= 1) badges.push({ ...BADGE_DEFINITIONS.attested, id: 'attested' });
   if (feedbackCount >= 5) badges.push({ ...BADGE_DEFINITIONS.trusted_by_many, id: 'trusted_by_many' });
@@ -272,21 +323,33 @@ function calculateBadges(fairscaleData, saidData, wallet) {
 }
 
 function calculateAgentFairScore(fairscaleData, features, saidData, wallet) {
-  // Start with FairScale base score
-  const baseScore = fairscaleData?.fairscore || 0;
+  // Base FairScale score (0-100)
+  const baseScore = fairscaleData?.fairscore || fairscaleData?.score || 0;
   
-  // Feature-weighted component (our own calculation based on features)
-  const featureScore = (features.longevity * 0.2) + (features.experience * 0.25) + 
-                       (features.conviction * 0.25) + (features.capital * 0.3);
-  
-  // Blend: 60% base FairScale, 40% our feature calculation
-  let score = (baseScore * 0.6) + (featureScore * 0.4);
-  
-  // SAID bonuses
+  // SAID score (0-100) - THIS IS IMPORTANT
+  const saidScore = saidData?.reputation?.score || 0;
   const feedbackCount = saidData?.reputation?.feedbackCount || 0;
-  score += Math.min(feedbackCount * 2, 10); // Up to +10 for attestations
-  if (saidData?.verified) score += 5;
-  if (saidData?.reputation?.trustTier === 'high') score += 5;
+  const trustTier = saidData?.reputation?.trustTier || 'unknown';
+  const isVerified = saidData?.verified || false;
+  
+  // Weight: 50% FairScale, 30% SAID score, 20% features
+  let score = 0;
+  
+  // FairScale contribution (50%)
+  score += baseScore * 0.5;
+  
+  // SAID score contribution (30%) - high SAID = high agent score
+  score += saidScore * 0.3;
+  
+  // Features contribution (20%)
+  const featureAvg = (features.longevity + features.experience + features.conviction + features.capital) / 4;
+  score += featureAvg * 0.2;
+  
+  // Bonuses
+  if (feedbackCount >= 1) score += 3;
+  if (feedbackCount >= 5) score += 5;
+  if (isVerified) score += 5;
+  if (trustTier === 'high') score += 5;
   
   // FairScale verification bonus (+15)
   if (REGISTRY.verifiedWallets.has(wallet)) {
@@ -301,7 +364,6 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet) {
 // =============================================================================
 
 async function getOrCreateAgent(wallet) {
-  // Check cache (5 min TTL)
   if (REGISTRY.agents.has(wallet)) {
     const cached = REGISTRY.agents.get(wallet);
     if (Date.now() - new Date(cached.lastUpdated).getTime() < 300000) {
@@ -316,7 +378,7 @@ async function getOrCreateAgent(wallet) {
   
   if (!fairscaleData && !saidData) return null;
   
-  const features = fairscaleData ? calculateFeatures(fairscaleData) : { longevity: 0, experience: 0, conviction: 0, capital: 0 };
+  const features = calculateFeatures(fairscaleData, saidData);
   const badges = calculateBadges(fairscaleData, saidData, wallet);
   const agentFairScore = calculateAgentFairScore(fairscaleData, features, saidData, wallet);
   
@@ -336,7 +398,7 @@ async function getOrCreateAgent(wallet) {
     skills: saidData?.skills || [],
     scores: {
       fairscore: agentFairScore,
-      fairscore_base: Math.round(fairscaleData?.fairscore || 0),
+      fairscore_base: Math.round(fairscaleData?.fairscore || fairscaleData?.score || 0),
       said_score: saidData?.reputation?.score || null,
       said_trust_tier: saidData?.reputation?.trustTier || null,
       attestations: saidData?.reputation?.feedbackCount || 0
@@ -363,8 +425,6 @@ function generateId() {
 }
 
 async function syncX402Services() {
-  console.log('Syncing x402 services...');
-  
   const [bazaarServices, communityServices] = await Promise.all([
     getX402BazaarServices(),
     getX402CommunityServices()
@@ -375,7 +435,6 @@ async function syncX402Services() {
   for (const svc of bazaarServices) {
     const serviceId = `bazaar_${generateId()}`;
     const rawPrice = svc.accepts?.[0]?.maxAmountRequired;
-    // Convert from micro-units to dollars (USDC has 6 decimals)
     const priceUsd = rawPrice ? (parseFloat(rawPrice) / 1000000).toFixed(4) : null;
     
     const serviceRecord = {
@@ -423,7 +482,6 @@ async function syncX402Services() {
   }
   
   REGISTRY.lastSync = new Date().toISOString();
-  console.log(`Synced ${added} new services. Total: ${REGISTRY.services.size}`);
   return { added, total: REGISTRY.services.size };
 }
 
@@ -434,12 +492,11 @@ async function syncX402Services() {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '6.2.0',
+    version: '6.3.0',
     endpoints: {
       'GET /score': 'Full reputation score for a wallet',
       'GET /services': 'List x402 services',
       'POST /verify': 'Verify payment and boost score',
-      'GET /verify/status/:wallet': 'Check verification status',
       'POST /sync': 'Sync x402 services'
     },
     verification: {
@@ -493,10 +550,6 @@ app.get('/score', async (req, res) => {
   });
 });
 
-// =============================================================================
-// VERIFICATION ROUTES
-// =============================================================================
-
 app.post('/verify', async (req, res) => {
   const { wallet } = req.body;
   
@@ -521,14 +574,12 @@ app.post('/verify', async (req, res) => {
       amount: verification.amount
     });
     
-    // Clear cache to recalculate score
     REGISTRY.agents.delete(wallet);
     
     return res.json({
       success: true,
       message: 'Verified! +15 score boost applied.',
-      txSignature: verification.txSignature,
-      amount: verification.amount
+      txSignature: verification.txSignature
     });
   }
   
@@ -543,17 +594,12 @@ app.post('/verify', async (req, res) => {
 app.get('/verify/status/:wallet', (req, res) => {
   const { wallet } = req.params;
   const verification = REGISTRY.verifiedWallets.get(wallet);
-  
   res.json(verification ? { verified: true, ...verification } : {
     verified: false,
     paymentAddress: CONFIG.PAYMENT_ADDRESS,
     requiredAmount: `$${CONFIG.VERIFICATION_AMOUNT} USDC`
   });
 });
-
-// =============================================================================
-// SERVICES ROUTES
-// =============================================================================
 
 app.get('/services', async (req, res) => {
   const { category, limit = 50, offset = 0 } = req.query;
@@ -563,27 +609,12 @@ app.get('/services', async (req, res) => {
   }
   
   let services = Array.from(REGISTRY.services.values());
-  
-  if (category) {
-    services = services.filter(s => s.category === category);
-  }
+  if (category) services = services.filter(s => s.category === category);
   
   const total = services.length;
   services = services.slice(Number(offset), Number(offset) + Number(limit));
   
-  res.json({
-    total,
-    services: services.map(s => ({
-      id: s.id,
-      source: s.source,
-      name: s.name,
-      resource: s.resource,
-      description: s.description,
-      category: s.category,
-      pricing: s.pricing,
-      discoveredAt: s.discoveredAt
-    }))
-  });
+  res.json({ total, services });
 });
 
 app.post('/sync', async (req, res) => {
@@ -597,17 +628,12 @@ app.get('/stats', (req, res) => {
     agents: agents.length,
     services: REGISTRY.services.size,
     verifiedWallets: REGISTRY.verifiedWallets.size,
-    avgScore: agents.length > 0 ? Math.round(agents.reduce((s, a) => s + a.scores.fairscore, 0) / agents.length) : 0,
-    lastSync: REGISTRY.lastSync
+    avgScore: agents.length > 0 ? Math.round(agents.reduce((s, a) => s + a.scores.fairscore, 0) / agents.length) : 0
   });
 });
 
-// =============================================================================
-// START
-// =============================================================================
-
 const PORT = CONFIG.PORT;
 app.listen(PORT, () => {
-  console.log(`FairScale Registry API v6.2 running on port ${PORT}`);
+  console.log(`FairScale Registry API v6.3 running on port ${PORT}`);
   syncX402Services();
 });
