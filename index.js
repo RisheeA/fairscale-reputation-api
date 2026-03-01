@@ -14,12 +14,7 @@ const CONFIG = {
   FAIRSCALE_API: 'https://api.fairscale.xyz',
   FAIRSCALE_API_KEY: process.env.FAIRSCALE_API_KEY,
   SAID_API: 'https://api.saidprotocol.com',
-  PORT: process.env.PORT || 3000,
-  
-  WEIGHTS: {
-    fairscale: 0.7,
-    said: 0.3
-  }
+  PORT: process.env.PORT || 8080
 };
 
 // =============================================================================
@@ -66,46 +61,123 @@ async function getSAIDScore(wallet) {
 }
 
 // =============================================================================
-// SCORE CALCULATIONS
+// SCORING FUNCTIONS
 // =============================================================================
 
 function calculateFeatures(data) {
-  const features = data.features || {};
+  const f = data.features || {};
   
-  // Economy: Holdings strength (major tokens + stablecoins)
-  const majorScore = (features.major_percentile_score || 0) * 100;
-  const stableScore = (features.stable_percentile_score || 0) * 100;
-  const economy = Math.round((majorScore * 0.6) + (stableScore * 0.4));
+  // Longevity: Age + Active days
+  const ageScore = Math.min((f.wallet_age_days || 0) / 365, 1);
+  const activeScore = Math.min((f.active_days || 0) / 180, 1);
+  const longevity = Math.round(((ageScore * 0.5) + (activeScore * 0.5)) * 100);
   
-  // Consistency: Regular activity over time
-  const activeDays = features.active_days || 0;
-  const walletAge = features.wallet_age_days || 1;
-  const activityRatio = Math.min(activeDays / walletAge, 1);
-  const consistency = Math.round(activityRatio * 100);
+  // Experience: Transaction count + Platform diversity
+  const txScore = Math.min((f.tx_count || 0) / 500, 1);
+  const diversityScore = f.platform_diversity || 0;
+  const experience = Math.round(((txScore * 0.5) + (diversityScore * 0.5)) * 100);
+  
+  // Conviction: Conviction ratio + Hold days + No dumps
+  const convictionRatio = f.conviction_ratio || 0;
+  const holdScore = Math.min((f.median_hold_days || 0) / 30, 1);
+  const noDumps = f.no_instant_dumps || 0;
+  const conviction = Math.round(((convictionRatio * 0.4) + (holdScore * 0.3) + (noDumps * 0.3)) * 100);
+  
+  // Capital: Major holdings + Net positive flow
+  const majorScore = f.major_percentile_score || 0;
+  const netFlow = f.net_sol_flow_30d || 0;
+  const netPositive = netFlow > 0 ? Math.min(netFlow / 100, 1) : 0;
+  const capital = Math.round(((majorScore * 0.5) + (netPositive * 0.5)) * 100);
   
   return {
-    economy: Math.min(economy, 100),
-    consistency: Math.min(consistency, 100)
+    longevity: Math.min(longevity, 100),
+    experience: Math.min(experience, 100),
+    conviction: Math.min(conviction, 100),
+    capital: Math.min(capital, 100)
   };
 }
 
-function calculateTrust(data, features) {
-  const baseScore = data.fairscore || 0;
-  const walletAge = data.features?.wallet_age_days || 0;
+function calculateBadges(data, saidData) {
+  const f = data.features || {};
+  const badges = [];
   
-  // Lending: Economy heavy (do they have assets to back loans?)
+  // Established: Wallet over 1 year
+  if ((f.wallet_age_days || 0) >= 365) {
+    badges.push({ id: 'established', label: 'Established' });
+  }
+  
+  // Committed: High conviction ratio
+  if ((f.conviction_ratio || 0) >= 0.7) {
+    badges.push({ id: 'committed', label: 'Committed' });
+  }
+  
+  // Capitalised: Top 20% holdings
+  if ((f.major_percentile_score || 0) >= 0.8) {
+    badges.push({ id: 'capitalised', label: 'Capitalised' });
+  }
+  
+  // Diverse: Uses many protocols
+  if ((f.platform_diversity || 0) >= 0.7) {
+    badges.push({ id: 'diverse', label: 'Diverse' });
+  }
+  
+  // Experienced: 500+ transactions
+  if ((f.tx_count || 0) >= 500) {
+    badges.push({ id: 'experienced', label: 'Experienced' });
+  }
+  
+  // Holder: Holds tokens 2+ weeks
+  if ((f.median_hold_days || 0) >= 14) {
+    badges.push({ id: 'holder', label: 'Holder' });
+  }
+  
+  // Net Positive: Adding capital
+  if ((f.net_sol_flow_30d || 0) > 0) {
+    badges.push({ id: 'net_positive', label: 'Net Positive' });
+  }
+  
+  // Staker: Active staker
+  if ((f.lst_percentile_score || 0) >= 0.7) {
+    badges.push({ id: 'staker', label: 'Staker' });
+  }
+  
+  // Social: Connected accounts (FairScale or SAID)
+  const hasFairScaleSocial = (data.social_score || 0) >= 50;
+  const hasSAIDSocial = saidData?.identity?.twitter || saidData?.identity?.website;
+  if (hasFairScaleSocial || hasSAIDSocial) {
+    badges.push({ id: 'social', label: 'Social' });
+  }
+  
+  // SAID Verified
+  if (saidData?.verified) {
+    badges.push({ id: 'said_verified', label: 'SAID Verified' });
+  }
+  
+  // SAID Trusted
+  if (saidData?.reputation?.trustTier === 'high') {
+    badges.push({ id: 'said_trusted', label: 'SAID Trusted' });
+  }
+  
+  return badges;
+}
+
+function calculateTrustScores(features, saidScore) {
+  const said = saidScore || 0;
+  
+  // Lending: Capital heavy
   const lending = Math.round(
-    (baseScore * 0.4) +
-    (features.economy * 0.4) +
-    (features.consistency * 0.2)
+    (features.capital * 0.35) +
+    (features.conviction * 0.30) +
+    (features.longevity * 0.20) +
+    (said * 0.15)
   );
   
-  // OTC: Consistency + age heavy (are they reliable over time?)
-  const ageScore = Math.min((walletAge / 365) * 100, 100);
+  // OTC: Longevity + Experience heavy
   const otc = Math.round(
-    (baseScore * 0.3) +
-    (features.consistency * 0.4) +
-    (ageScore * 0.3)
+    (features.longevity * 0.30) +
+    (features.experience * 0.25) +
+    (features.conviction * 0.25) +
+    (said * 0.20)
   );
   
   return {
@@ -114,19 +186,27 @@ function calculateTrust(data, features) {
   };
 }
 
-function calculateCombinedScore(fairscaleScore, saidReputation) {
-  if (!saidReputation) {
-    return Math.round(fairscaleScore);
-  }
+function calculateAgentScore(features, socialCombined, saidScore) {
+  const said = saidScore || 0;
+  const social = socialCombined || 0;
   
-  // SAID is 0-10000 basis points, convert to 0-100
-  const saidNormalized = (saidReputation / 10000) * 100;
+  const score = Math.round(
+    (features.longevity * 0.20) +
+    (features.experience * 0.20) +
+    (features.conviction * 0.25) +
+    (features.capital * 0.15) +
+    (social * 0.10) +
+    (said * 0.10)
+  );
   
-  const combined = 
-    (fairscaleScore * CONFIG.WEIGHTS.fairscale) +
-    (saidNormalized * CONFIG.WEIGHTS.said);
+  return Math.min(score, 100);
+}
+
+function calculateSocialCombined(fairscaleSocial, saidData) {
+  const fsScore = (fairscaleSocial || 0) / 100;
+  const hasSAIDSocial = (saidData?.identity?.twitter || saidData?.identity?.website) ? 1 : 0;
   
-  return Math.round(combined);
+  return Math.round(((fsScore * 0.5) + (hasSAIDSocial * 0.5)) * 100);
 }
 
 // =============================================================================
@@ -140,7 +220,7 @@ app.get('/', (req, res) => {
     status: 'ok',
     endpoints: {
       'GET /score': 'Full reputation score',
-      'GET /check': 'Quick risk assessment'
+      'GET /check': 'Quick trust scores'
     },
     docs: 'https://docs.fairscale.xyz'
   });
@@ -169,38 +249,54 @@ app.get('/score', async (req, res) => {
     });
   }
   
-  // Calculate
+  // Calculate features
   const features = calculateFeatures(fairscaleData);
-  const trust = calculateTrust(fairscaleData, features);
   
-  // SAID data
+  // Calculate badges
+  const badges = calculateBadges(fairscaleData, saidData);
+  
+  // Get SAID score (0-100)
+  const saidScore = saidData?.reputation?.score || 0;
+  
+  // Calculate social combined
+  const socialCombined = calculateSocialCombined(fairscaleData.social_score, saidData);
+  
+  // Calculate agent score
+  const agentScore = calculateAgentScore(features, socialCombined, saidScore);
+  
+  // Calculate trust scores
+  const trust = calculateTrustScores(features, saidScore);
+  
+  // Build social object
+  const social = {
+    fairscale: fairscaleData.social_score || null,
+    said: !!(saidData?.identity?.twitter || saidData?.identity?.website)
+  };
+  
+  // Build SAID object
   const said = saidData ? {
     registered: saidData.registered || false,
     verified: saidData.verified || false,
-    reputation: saidData.reputation ? Math.round(saidData.reputation / 100) : null
+    name: saidData.identity?.name || null,
+    score: saidData.reputation?.score || null,
+    trust_tier: saidData.reputation?.trustTier || null,
+    skills: saidData.skills || []
   } : {
     registered: false,
     verified: false,
-    reputation: null
+    name: null,
+    score: null,
+    trust_tier: null,
+    skills: []
   };
-  
-  // Combined score
-  const reputationScore = calculateCombinedScore(
-    fairscaleData.fairscore || 0,
-    saidData?.reputation || null
-  );
   
   return res.json({
     wallet,
-    reputation_score: reputationScore,
-    
-    fairscale: {
-      score: Math.round(fairscaleData.fairscore || 0),
-      features,
-      trust,
-      social: fairscaleData.social_score || null
-    },
-    
+    fairscale_agent_score: agentScore,
+    trust,
+    badges,
+    features,
+    social,
     said
   });
 });
@@ -225,30 +321,26 @@ app.get('/check', async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch score' });
   }
   
+  // Calculate features
   const features = calculateFeatures(fairscaleData);
-  const trust = calculateTrust(fairscaleData, features);
   
-  const said = saidData ? {
-    registered: saidData.registered || false,
-    verified: saidData.verified || false,
-    reputation: saidData.reputation ? Math.round(saidData.reputation / 100) : null
-  } : {
-    registered: false,
-    verified: false,
-    reputation: null
-  };
+  // Get SAID score
+  const saidScore = saidData?.reputation?.score || 0;
   
-  const reputationScore = calculateCombinedScore(
-    fairscaleData.fairscore || 0,
-    saidData?.reputation || null
-  );
+  // Calculate social combined
+  const socialCombined = calculateSocialCombined(fairscaleData.social_score, saidData);
+  
+  // Calculate agent score
+  const agentScore = calculateAgentScore(features, socialCombined, saidScore);
+  
+  // Calculate trust scores
+  const trust = calculateTrustScores(features, saidScore);
   
   return res.json({
     wallet,
-    reputation_score: reputationScore,
-    fairscale_score: Math.round(fairscaleData.fairscore || 0),
+    fairscale_agent_score: agentScore,
     trust,
-    said_verified: said.verified
+    said_verified: saidData?.verified || false
   });
 });
 
@@ -276,10 +368,9 @@ app.listen(CONFIG.PORT, () => {
 ║                                                       ║
 ║  Endpoints:                                           ║
 ║    GET /score   Full reputation score                 ║
-║    GET /check   Quick risk assessment                 ║
+║    GET /check   Quick trust scores                    ║
 ║                                                       ║
-║  Sources:                                             ║
-║    FairScale (70%) + SAID (30%)                       ║
+║  Sources: FairScale + SAID                            ║
 ╚═══════════════════════════════════════════════════════╝
   `);
 });
