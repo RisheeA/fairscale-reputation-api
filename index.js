@@ -259,27 +259,31 @@ function getFeatureDescription(feature, value) {
 // =============================================================================
 
 function calculateAgentFairScore(fairscaleData, features, saidData, wallet) {
-  // FairScale's score (50%)
+  // FairScale's score (40%)
   const fsScore = fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0;
-  const fsComponent = fsScore * 0.50;
+  const fsComponent = fsScore * 0.40;
   
-  // Our metrics (35%)
+  // Our metrics (30%)
   const featureAvg = (features.activity + features.holdings + features.reliability + features.history) / 4;
-  const featureComponent = featureAvg * 0.35;
+  const featureComponent = featureAvg * 0.30;
   
-  // SAID reputation (10%)
+  // SAID reputation (20%)
   const saidScore = saidData?.reputation?.score || 0;
-  const saidComponent = saidScore * 0.10;
+  const saidComponent = saidScore * 0.20;
   
-  // Bonuses (up to 5%)
+  // Bonuses (up to 10%)
   let bonuses = 0;
-  if (saidData?.verified) bonuses += 1;
-  if (saidData?.reputation?.trustTier === 'high') bonuses += 1;
-  if ((saidData?.reputation?.feedbackCount || 0) >= 1) bonuses += 1;
-  if (REGISTRY.registeredAgents.has(wallet)) bonuses += 1;
+  if (saidData?.verified) bonuses += 2;
+  if (saidData?.reputation?.trustTier === 'high') bonuses += 3;
+  
+  // Attestations: +5 per attestation, up to 15
+  const attestations = saidData?.reputation?.feedbackCount || 0;
+  bonuses += Math.min(attestations * 5, 15);
+  
+  if (REGISTRY.registeredAgents.has(wallet)) bonuses += 2;
   if (REGISTRY.verifiedWallets.has(wallet)) bonuses += 5;
   
-  const total = fsComponent + featureComponent + saidComponent + Math.min(bonuses, 5);
+  const total = fsComponent + featureComponent + saidComponent + Math.min(bonuses, 15);
   
   // Minimum score is 10
   return Math.max(Math.min(Math.round(total), 100), 10);
