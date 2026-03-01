@@ -67,27 +67,28 @@ async function getSAIDScore(wallet) {
 function calculateFeatures(data) {
   const f = data.features || {};
   
-  // Longevity: Age + Active days (agent-friendly: 30 days = max)
-  const ageScore = Math.min((f.wallet_age_days || 0) / 30, 1);
-  const activeScore = Math.min((f.active_days || 0) / 14, 1);
-  const longevity = Math.round(((ageScore * 0.5) + (activeScore * 0.5)) * 100);
+  // Values from FairScale are already 0-100 percentiles
   
-  // Experience: Transaction count + Platform diversity (agent-friendly: 50 txs = max)
-  const txScore = Math.min((f.tx_count || 0) / 50, 1);
+  // Longevity: Wallet age + Active days
+  const ageScore = f.wallet_age_score || 0;
+  const activeScore = f.active_days || 0;
+  const longevity = Math.round((ageScore + activeScore) / 2);
+  
+  // Experience: Transaction count + Platform diversity
+  const txScore = f.tx_count || 0;
   const diversityScore = f.platform_diversity || 0;
-  const experience = Math.round(((txScore * 0.5) + (diversityScore * 0.5)) * 100);
+  const experience = Math.round((txScore + diversityScore) / 2);
   
   // Conviction: Conviction ratio + Hold days + No dumps
   const convictionRatio = f.conviction_ratio || 0;
-  const holdScore = Math.min((f.median_hold_days || 0) / 7, 1);
+  const holdScore = f.median_hold_days || 0;
   const noDumps = f.no_instant_dumps || 0;
-  const conviction = Math.round(((convictionRatio * 0.4) + (holdScore * 0.3) + (noDumps * 0.3)) * 100);
+  const conviction = Math.round((convictionRatio + holdScore + noDumps) / 3);
   
-  // Capital: Major holdings + Net positive flow
+  // Capital: Major holdings + Stablecoins
   const majorScore = f.major_percentile_score || 0;
-  const netFlow = f.net_sol_flow_30d || 0;
-  const netPositive = netFlow > 0 ? Math.min(netFlow / 100, 1) : 0;
-  const capital = Math.round(((majorScore * 0.5) + (netPositive * 0.5)) * 100);
+  const stableScore = f.stable_percentile_score || 0;
+  const capital = Math.round((majorScore + stableScore) / 2);
   
   return {
     longevity: Math.min(longevity, 100),
@@ -101,43 +102,43 @@ function calculateBadges(data, saidData) {
   const f = data.features || {};
   const badges = [];
   
-  // Established: Wallet over 1 year
-  if ((f.wallet_age_days || 0) >= 365) {
+  // Established: High wallet age score
+  if ((f.wallet_age_score || 0) >= 70) {
     badges.push({ id: 'established', label: 'Established' });
   }
   
   // Committed: High conviction ratio
-  if ((f.conviction_ratio || 0) >= 0.7) {
+  if ((f.conviction_ratio || 0) >= 70) {
     badges.push({ id: 'committed', label: 'Committed' });
   }
   
-  // Capitalised: Top 20% holdings
-  if ((f.major_percentile_score || 0) >= 0.8) {
+  // Capitalised: High holdings
+  if ((f.major_percentile_score || 0) >= 70) {
     badges.push({ id: 'capitalised', label: 'Capitalised' });
   }
   
   // Diverse: Uses many protocols
-  if ((f.platform_diversity || 0) >= 0.7) {
+  if ((f.platform_diversity || 0) >= 60) {
     badges.push({ id: 'diverse', label: 'Diverse' });
   }
   
-  // Experienced: 500+ transactions
-  if ((f.tx_count || 0) >= 500) {
+  // Experienced: High transaction count percentile
+  if ((f.tx_count || 0) >= 70) {
     badges.push({ id: 'experienced', label: 'Experienced' });
   }
   
-  // Holder: Holds tokens 2+ weeks
-  if ((f.median_hold_days || 0) >= 14) {
+  // Holder: Long hold times
+  if ((f.median_hold_days || 0) >= 70) {
     badges.push({ id: 'holder', label: 'Holder' });
   }
   
   // Net Positive: Adding capital
-  if ((f.net_sol_flow_30d || 0) > 0) {
+  if ((f.net_sol_flow_30d || 0) > 50) {
     badges.push({ id: 'net_positive', label: 'Net Positive' });
   }
   
   // Staker: Active staker
-  if ((f.lst_percentile_score || 0) >= 0.7) {
+  if ((f.lst_percentile_score || 0) >= 50) {
     badges.push({ id: 'staker', label: 'Staker' });
   }
   
