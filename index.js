@@ -129,143 +129,128 @@ async function verifyPayment(senderWallet) {
 }
 
 // =============================================================================
-// SCORING - LOGARITHMIC SCALE (hard to reach 100)
+// SCORING - USE FAIRSCALE DATA DIRECTLY
 // =============================================================================
 
-function logScale(value, max, curve = 2) {
+function scale(value, max, curve = 1.5) {
+  // Soft curve for diminishing returns
   const normalized = Math.min(value / max, 1);
-  return Math.min(Math.round(Math.pow(normalized, 1 / curve) * 100), 99);
+  const scaled = Math.pow(normalized, 1 / curve) * 100;
+  return Math.max(Math.round(scaled), 10); // Minimum 10
+}
+
+function percentileToScore(percentile) {
+  // Percentiles are already 0-100 scale from FairScale
+  return Math.max(Math.round(percentile), 10); // Minimum 10
 }
 
 // =============================================================================
-// AGENT METRICS - TRUST-FOCUSED
-// 
-// What makes you trust an agent?
-// 1. ACTIVITY - Are they consistently doing things on-chain?
-// 2. DIVERSITY - Do they operate across multiple protocols?
-// 3. RELIABILITY - Are their patterns predictable and stable?
-// 4. TRACK RECORD - How long have they been active?
+// AGENT METRICS - DIRECTLY FROM FAIRSCALE FEATURES
 // =============================================================================
 
 function calculateAgentFeatures(fairscaleData) {
   const f = fairscaleData?.features || {};
   
-  // Raw FairScale features
+  // ==========================================================================
+  // ACTIVITY - tx_count, active_days, platform_diversity
+  // ==========================================================================
+  
   const txCount = f.tx_count || 0;
   const activeDays = f.active_days || 0;
-  const walletAgeDays = f.wallet_age_days || 0;
   const platformDiversity = f.platform_diversity || 0;
-  const medianGapHours = f.median_gap_hours || 0;
+  
+  const txScore = scale(txCount, 150, 1.8);
+  const activeScore = scale(activeDays, 30, 1.5);
+  const diversityScore = scale(platformDiversity, 5, 1.5);
+  
+  const activity = Math.max(Math.round((txScore * 0.5) + (activeScore * 0.3) + (diversityScore * 0.2)), 10);
+  
+  // ==========================================================================
+  // HOLDINGS - percentile scores (already 0-100 from FairScale)
+  // ==========================================================================
+  
+  const lstPercentile = f.lst_percentile_score || 0;
+  const majorPercentile = f.major_percentile_score || 0;
+  const stablePercentile = f.stable_percentile_score || 0;
+  const solPercentile = f.native_sol_percentile || 0;
+  
+  const holdings = Math.max(Math.round(
+    (percentileToScore(lstPercentile) * 0.3) +
+    (percentileToScore(majorPercentile) * 0.3) +
+    (percentileToScore(stablePercentile) * 0.2) +
+    (percentileToScore(solPercentile) * 0.2)
+  ), 10);
+  
+  // ==========================================================================
+  // RELIABILITY - no_instant_dumps, conviction_ratio, tempo patterns
+  // ==========================================================================
+  
+  const noInstantDumps = f.no_instant_dumps || 0; // 0-1
+  const convictionRatio = f.conviction_ratio || 0; // 0-1
   const tempoCV = f.tempo_cv || 0;
   const burstRatio = f.burst_ratio || 0;
-  const convictionRatio = f.conviction_ratio || 0;
-  const noInstantDumps = f.no_instant_dumps || 0;
+  
+  const dumpScore = Math.max(noInstantDumps * 100, 10);
+  const convictionScore = Math.max(convictionRatio * 100, 10);
+  
+  // Lower tempo CV and burst ratio = more predictable = better
+  const patternScore = tempoCV > 0 || burstRatio > 0 
+    ? Math.max(100 - (tempoCV * 20) - (burstRatio * 30), 10)
+    : 50; // Neutral if no data
+  
+  const reliability = Math.max(Math.round(
+    (dumpScore * 0.4) + (convictionScore * 0.3) + (patternScore * 0.3)
+  ), 10);
   
   // ==========================================================================
-  // ACTIVITY - "Is this agent consistently transacting?"
-  // High tx count + high activity ratio = actively maintained agent
+  // HISTORY - wallet_age_score, median_hold_days
   // ==========================================================================
   
-  const txScore = logScale(txCount, 300, 2.5);
-  const activityRatio = walletAgeDays > 0 ? activeDays / walletAgeDays : 0;
-  const consistencyScore = logScale(activityRatio * 100, 60, 2); // 60% active = max
+  const walletAgeScore = f.wallet_age_score || 0;
+  const medianHoldDays = f.median_hold_days || 0;
   
-  // Penalize erratic burst patterns (suggests bot spam, not real usage)
-  const burstPenalty = burstRatio > 0.8 ? 0.6 : burstRatio > 0.5 ? 0.8 : 1;
+  const ageScore = Math.max(walletAgeScore, 10); // Already a score from FairScale
+  const holdScore = scale(medianHoldDays, 30, 1.5);
   
-  const activity = Math.round(((txScore * 0.5) + (consistencyScore * 0.5)) * burstPenalty);
-  
-  // ==========================================================================
-  // DIVERSITY - "Does this agent integrate across the ecosystem?"
-  // More protocols = more useful, more battle-tested
-  // ==========================================================================
-  
-  const protocolScore = logScale(platformDiversity, 8, 2);
-  const recentBonus = activityRatio > 0.3 ? 8 : 0; // Bonus if recently active
-  
-  const diversity = Math.min(protocolScore + recentBonus, 99);
-  
-  // ==========================================================================
-  // RELIABILITY - "Can you predict this agent's behavior?"
-  // Consistent timing + follows through on transactions + no dumps
-  // ==========================================================================
-  
-  // Tempo CV: lower = more consistent timing (good)
-  const tempoScore = tempoCV > 0 ? Math.min(logScale(1 / tempoCV, 1.5, 2), 99) : 50;
-  
-  // No instant dumps = follows through, doesn't rug
-  const followThrough = logScale(noInstantDumps * 100, 100, 1.5);
-  
-  // Conviction = holds positions, doesn't flip constantly
-  const holdingScore = logScale(convictionRatio * 100, 80, 2);
-  
-  const reliability = Math.round((tempoScore * 0.25) + (followThrough * 0.4) + (holdingScore * 0.35));
-  
-  // ==========================================================================
-  // TRACK RECORD - "How long has this agent been operating?"
-  // Age alone isn't enough - needs sustained activity
-  // ==========================================================================
-  
-  const ageScore = logScale(walletAgeDays, 90, 2.5);
-  const sustainedActivity = activityRatio > 0.2 ? 1.15 : 0.85; // Multiplier
-  
-  const trackRecord = Math.min(Math.round(ageScore * sustainedActivity), 99);
-  
-  // ==========================================================================
-  // FALLBACK - When FairScale features are empty
-  // ==========================================================================
-  
-  const allZero = walletAgeDays === 0 && txCount === 0 && activeDays === 0;
-  
-  if (allZero && fairscaleData) {
-    const fsBase = fairscaleData.fairscore || fairscaleData.fairscore_base || 0;
-    return {
-      activity: Math.round(fsBase * 0.80),
-      diversity: Math.round(fsBase * 0.70),
-      reliability: Math.round(fsBase * 0.75),
-      trackRecord: Math.round(fsBase * 0.65),
-      _fallback: true
-    };
-  }
+  const history = Math.max(Math.round((ageScore * 0.6) + (holdScore * 0.4)), 10);
   
   return {
-    activity: Math.min(Math.max(activity, 0), 99),
-    diversity: Math.min(Math.max(diversity, 0), 99),
-    reliability: Math.min(Math.max(reliability, 0), 99),
-    trackRecord: Math.min(Math.max(trackRecord, 0), 99),
-    _fallback: false
+    activity,
+    holdings,
+    reliability,
+    history
   };
 }
 
 // =============================================================================
-// FEATURE DESCRIPTIONS - Actionable trust signals
+// FEATURE DESCRIPTIONS
 // =============================================================================
 
 function getFeatureDescription(feature, value) {
   const descriptions = {
     activity: {
-      high: '200+ transactions, active most days',
-      mid: 'Moderate transaction volume',
-      low: 'Limited on-chain activity'
+      high: 'High transaction volume across multiple protocols',
+      mid: 'Moderate on-chain activity',
+      low: 'Limited transaction history'
     },
-    diversity: {
-      high: 'Integrated with 6+ protocols',
-      mid: 'Uses 3-5 different protocols',
-      low: 'Single protocol usage'
+    holdings: {
+      high: 'Strong token positions (SOL, LST, stables)',
+      mid: 'Moderate token holdings',
+      low: 'Minimal token positions'
     },
     reliability: {
-      high: 'Consistent patterns, completes transactions',
-      mid: 'Some variance in behavior',
-      low: 'Unpredictable or incomplete transactions'
+      high: 'No panic sells, consistent behavior',
+      mid: 'Generally stable patterns',
+      low: 'Variable transaction patterns'
     },
-    trackRecord: {
-      high: '60+ days of sustained activity',
-      mid: '30-60 days active',
-      low: 'New or sporadic presence'
+    history: {
+      high: 'Established wallet with holding history',
+      mid: 'Some track record',
+      low: 'New or limited history'
     }
   };
   
-  const tier = value >= 55 ? 'high' : value >= 28 ? 'mid' : 'low';
+  const tier = value >= 50 ? 'high' : value >= 25 ? 'mid' : 'low';
   return descriptions[feature]?.[tier] || '';
 }
 
@@ -274,31 +259,30 @@ function getFeatureDescription(feature, value) {
 // =============================================================================
 
 function calculateAgentFairScore(fairscaleData, features, saidData, wallet) {
-  // FairScale base score (40%)
-  const fsBase = fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0;
-  const fsScore = logScale(fsBase, 100, 1.5) * 0.40;
+  // FairScale's score (50%)
+  const fsScore = fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0;
+  const fsComponent = fsScore * 0.50;
   
-  // Our trust metrics (40%)
-  const featureScore = (
-    (features.activity * 0.30) +
-    (features.diversity * 0.20) +
-    (features.reliability * 0.30) +
-    (features.trackRecord * 0.20)
-  ) * 0.40;
+  // Our metrics (35%)
+  const featureAvg = (features.activity + features.holdings + features.reliability + features.history) / 4;
+  const featureComponent = featureAvg * 0.35;
   
   // SAID reputation (10%)
-  const saidScore = (saidData?.reputation?.score || 0) * 0.10;
+  const saidScore = saidData?.reputation?.score || 0;
+  const saidComponent = saidScore * 0.10;
   
-  // Bonuses (up to 10%)
+  // Bonuses (up to 5%)
   let bonuses = 0;
-  if (saidData?.verified) bonuses += 2;
-  if (saidData?.reputation?.trustTier === 'high') bonuses += 2;
-  bonuses += Math.min((saidData?.reputation?.feedbackCount || 0), 4);
+  if (saidData?.verified) bonuses += 1;
+  if (saidData?.reputation?.trustTier === 'high') bonuses += 1;
+  if ((saidData?.reputation?.feedbackCount || 0) >= 1) bonuses += 1;
   if (REGISTRY.registeredAgents.has(wallet)) bonuses += 1;
-  if (REGISTRY.verifiedWallets.has(wallet)) bonuses += 8;
+  if (REGISTRY.verifiedWallets.has(wallet)) bonuses += 5;
   
-  const total = fsScore + featureScore + saidScore + Math.min(bonuses, 10);
-  return Math.min(Math.round(total), 100);
+  const total = fsComponent + featureComponent + saidComponent + Math.min(bonuses, 5);
+  
+  // Minimum score is 10
+  return Math.max(Math.min(Math.round(total), 100), 10);
 }
 
 // =============================================================================
@@ -332,22 +316,22 @@ async function getOrCreateAgent(wallet) {
     mcp: regData?.mcp || saidData?.endpoints?.mcp || null,
     scores: {
       agent_fairscore: agentFairScore,
-      fairscore_base: Math.round(fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0),
+      fairscore_base: Math.round(fairscaleData?.fairscore_base || fairscaleData?.fairscore || 0),
       said_score: saidData?.reputation?.score || null,
       said_trust_tier: saidData?.reputation?.trustTier || null,
       attestations: saidData?.reputation?.feedbackCount || 0
     },
     features: {
       activity: features.activity,
-      diversity: features.diversity,
+      holdings: features.holdings,
       reliability: features.reliability,
-      trackRecord: features.trackRecord
+      history: features.history
     },
     descriptions: {
       activity: getFeatureDescription('activity', features.activity),
-      diversity: getFeatureDescription('diversity', features.diversity),
+      holdings: getFeatureDescription('holdings', features.holdings),
       reliability: getFeatureDescription('reliability', features.reliability),
-      trackRecord: getFeatureDescription('trackRecord', features.trackRecord)
+      history: getFeatureDescription('history', features.history)
     },
     isRegistered: REGISTRY.registeredAgents.has(wallet),
     isVerified: REGISTRY.verifiedWallets.has(wallet),
