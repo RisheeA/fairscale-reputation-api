@@ -1,7 +1,7 @@
 {
   "name": "fairscale-reputation-api",
   "version": "4.0.0",
-  "description": "Reputation scoring API combining FairScale + SAID",
+  "description": "FairScale Agent Reputation API",
   "type": "module",
   "main": "index.js",
   "scripts": {
