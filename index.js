@@ -68,6 +68,7 @@ function calculateFeatures(data) {
   const f = data.features || {};
   
   // Values from FairScale are already 0-100 percentiles
+  // Exception: no_instant_dumps is 0-1
   
   // Longevity: Wallet age + Active days
   const ageScore = f.wallet_age_score || 0;
@@ -79,10 +80,10 @@ function calculateFeatures(data) {
   const diversityScore = f.platform_diversity || 0;
   const experience = Math.round((txScore + diversityScore) / 2);
   
-  // Conviction: Conviction ratio + Hold days + No dumps
+  // Conviction: Conviction ratio + Hold days + No dumps (scaled)
   const convictionRatio = f.conviction_ratio || 0;
   const holdScore = f.median_hold_days || 0;
-  const noDumps = f.no_instant_dumps || 0;
+  const noDumps = (f.no_instant_dumps || 0) * 100; // Scale 0-1 to 0-100
   const conviction = Math.round((convictionRatio + holdScore + noDumps) / 3);
   
   // Capital: Major holdings + Stablecoins
@@ -96,6 +97,82 @@ function calculateFeatures(data) {
     conviction: Math.min(conviction, 100),
     capital: Math.min(capital, 100)
   };
+}
+
+function buildInfo(fairscaleData, saidData, features) {
+  const info = {
+    description: null,
+    skills: [],
+    actions: [],
+    highlights: [],
+    tier: null
+  };
+  
+  // From SAID
+  if (saidData?.identity?.description) {
+    info.description = saidData.identity.description;
+  }
+  
+  if (saidData?.skills?.length > 0) {
+    info.skills = saidData.skills;
+  }
+  
+  // From FairScale
+  if (fairscaleData.tier) {
+    info.tier = fairscaleData.tier;
+  }
+  
+  if (fairscaleData.actions?.length > 0) {
+    info.actions = fairscaleData.actions.map(a => ({
+      id: a.id,
+      label: a.label,
+      description: a.description,
+      priority: a.priority
+    }));
+  }
+  
+  // Generate highlights based on features
+  const highlights = [];
+  
+  if (features.longevity >= 70) {
+    highlights.push('Established wallet with consistent activity');
+  } else if (features.longevity >= 40) {
+    highlights.push('Moderately active wallet');
+  } else if (features.longevity < 20) {
+    highlights.push('New or inactive wallet');
+  }
+  
+  if (features.experience >= 70) {
+    highlights.push('Highly experienced across multiple protocols');
+  } else if (features.experience >= 40) {
+    highlights.push('Moderate transaction history');
+  }
+  
+  if (features.conviction >= 80) {
+    highlights.push('Strong holder with diamond hands');
+  } else if (features.conviction >= 50) {
+    highlights.push('Shows holding conviction');
+  }
+  
+  if (features.capital >= 70) {
+    highlights.push('Well-capitalised wallet');
+  } else if (features.capital >= 40) {
+    highlights.push('Moderate holdings');
+  } else if (features.capital < 20) {
+    highlights.push('Low capital base');
+  }
+  
+  if (saidData?.verified) {
+    highlights.push('SAID verified identity');
+  }
+  
+  if (saidData?.reputation?.trustTier === 'high') {
+    highlights.push('High trust tier on SAID');
+  }
+  
+  info.highlights = highlights;
+  
+  return info;
 }
 
 function calculateBadges(data, saidData) {
@@ -298,12 +375,16 @@ app.get('/score', async (req, res) => {
     skills: []
   };
   
+  // Build info section
+  const info = buildInfo(fairscaleData, saidData, features);
+  
   return res.json({
     wallet,
-    fairscale_agent_score: agentScore,
-    trust,
+    agent_fairscore: agentScore,
+    fairscore_base: Math.round(fairscaleData.fairscore || 0),
     badges,
     features,
+    info,
     social,
     said
   });
@@ -346,8 +427,8 @@ app.get('/check', async (req, res) => {
   
   return res.json({
     wallet,
-    fairscale_agent_score: agentScore,
-    trust,
+    agent_fairscore: agentScore,
+    fairscore_base: Math.round(fairscaleData.fairscore || 0),
     said_verified: saidData?.verified || false
   });
 });
