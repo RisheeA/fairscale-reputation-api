@@ -1,7 +1,5 @@
 import express from 'express';
 import cors from 'cors';
-import nacl from 'tweetnacl';
-import bs58 from 'bs58';
 import 'dotenv/config';
 
 const app = express();
@@ -49,9 +47,8 @@ function logScaleInverse(value, max, curve = 2) {
 const REGISTRY = {
   agents: new Map(),
   registeredAgents: new Map(),
-  services: new Map(),        // x402 services registered by agents
+  services: new Map(),
   verifiedWallets: new Map(),
-  challenges: new Map(),      // For signature verification
   lastSync: null
 };
 
@@ -84,27 +81,6 @@ async function getSAIDData(wallet) {
   } catch (e) {
     console.error('SAID error:', e.message);
     return null;
-  }
-}
-
-// =============================================================================
-// SIGNATURE VERIFICATION
-// =============================================================================
-
-function generateChallenge(wallet) {
-  const challenge = `fairscale:${wallet}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  REGISTRY.challenges.set(wallet, { challenge, expires: Date.now() + 300000 }); // 5 min
-  return challenge;
-}
-
-function verifySignature(wallet, signature, message) {
-  try {
-    const publicKey = bs58.decode(wallet);
-    const signatureBytes = bs58.decode(signature);
-    const messageBytes = new TextEncoder().encode(message);
-    return nacl.sign.detached.verify(messageBytes, signatureBytes, publicKey);
-  } catch (e) {
-    return false;
   }
 }
 
@@ -385,22 +361,13 @@ app.get('/', (req, res) => {
     version: '9.0.0',
     endpoints: {
       'GET /score': 'Get agent score',
-      'POST /register': 'Register agent (requires signature)',
+      'POST /register': 'Register agent',
       'POST /verify': 'Verify payment',
-      'GET /challenge': 'Get signing challenge',
-      'POST /service': 'Register x402 service (requires signature)',
+      'POST /service': 'Register x402 service',
       'GET /services': 'List services',
       'GET /directory': 'List agents'
     }
   });
-});
-
-// Get signing challenge
-app.get('/challenge', (req, res) => {
-  const { wallet } = req.query;
-  if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
-  const challenge = generateChallenge(wallet);
-  res.json({ challenge, expiresIn: 300 });
 });
 
 // Get agent score
@@ -432,28 +399,15 @@ app.get('/score', async (req, res) => {
   });
 });
 
-// Register agent (requires signature)
+// Register agent
 app.post('/register', async (req, res) => {
-  const { wallet, signature, challenge, name, description, website, mcp } = req.body;
+  const { wallet, name, description, website, mcp } = req.body;
   
   if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
   
-  // If signature provided, verify it
-  if (signature && challenge) {
-    const stored = REGISTRY.challenges.get(wallet);
-    if (!stored || stored.challenge !== challenge || Date.now() > stored.expires) {
-      return res.status(400).json({ error: 'Invalid or expired challenge' });
-    }
-    if (!verifySignature(wallet, signature, challenge)) {
-      return res.status(400).json({ error: 'Invalid signature' });
-    }
-    REGISTRY.challenges.delete(wallet);
-  }
-  
   REGISTRY.registeredAgents.set(wallet, {
     wallet, name, description, website, mcp,
-    registeredAt: new Date().toISOString(),
-    verified: !!signature
+    registeredAt: new Date().toISOString()
   });
   
   REGISTRY.agents.delete(wallet);
@@ -461,7 +415,7 @@ app.post('/register', async (req, res) => {
   
   res.json({
     success: true,
-    message: signature ? 'Registered with signature verification' : 'Registered (unverified)',
+    message: 'Agent registered',
     agent: agent ? {
       wallet,
       name: agent.name,
@@ -470,27 +424,13 @@ app.post('/register', async (req, res) => {
   });
 });
 
-// Register x402 service (requires signature)
+// Register x402 service
 app.post('/service', async (req, res) => {
-  const { wallet, signature, challenge, url, name, description, price, category } = req.body;
+  const { wallet, url, name, description, price, category } = req.body;
   
   if (!wallet || !url || !name) {
     return res.status(400).json({ error: 'Missing wallet, url, or name' });
   }
-  
-  // Require signature for service registration
-  if (!signature || !challenge) {
-    return res.status(400).json({ error: 'Signature required. Get challenge from /challenge first.' });
-  }
-  
-  const stored = REGISTRY.challenges.get(wallet);
-  if (!stored || stored.challenge !== challenge || Date.now() > stored.expires) {
-    return res.status(400).json({ error: 'Invalid or expired challenge' });
-  }
-  if (!verifySignature(wallet, signature, challenge)) {
-    return res.status(400).json({ error: 'Invalid signature' });
-  }
-  REGISTRY.challenges.delete(wallet);
   
   const serviceId = `svc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   
