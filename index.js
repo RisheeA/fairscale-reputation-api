@@ -133,15 +133,15 @@ async function verifyPayment(senderWallet) {
 // =============================================================================
 
 function scale(value, max, curve = 1.5) {
-  // Soft curve for diminishing returns
+  // Soft curve for diminishing returns, always 10-100
   const normalized = Math.min(value / max, 1);
   const scaled = Math.pow(normalized, 1 / curve) * 100;
-  return Math.max(Math.round(scaled), 10); // Minimum 10
+  return Math.min(Math.max(Math.round(scaled), 10), 100);
 }
 
 function percentileToScore(percentile) {
-  // Percentiles are already 0-100 scale from FairScale
-  return Math.max(Math.round(percentile), 10); // Minimum 10
+  // Percentiles are already 0-100 scale from FairScale, cap just in case
+  return Math.min(Math.max(Math.round(percentile), 10), 100);
 }
 
 // =============================================================================
@@ -163,7 +163,7 @@ function calculateAgentFeatures(fairscaleData) {
   const activeScore = scale(activeDays, 30, 1.5);
   const diversityScore = scale(platformDiversity, 5, 1.5);
   
-  const activity = Math.max(Math.round((txScore * 0.5) + (activeScore * 0.3) + (diversityScore * 0.2)), 10);
+  const activity = Math.min(Math.max(Math.round((txScore * 0.5) + (activeScore * 0.3) + (diversityScore * 0.2)), 10), 100);
   
   // ==========================================================================
   // HOLDINGS - percentile scores (already 0-100 from FairScale)
@@ -174,12 +174,12 @@ function calculateAgentFeatures(fairscaleData) {
   const stablePercentile = f.stable_percentile_score || 0;
   const solPercentile = f.native_sol_percentile || 0;
   
-  const holdings = Math.max(Math.round(
+  const holdings = Math.min(Math.max(Math.round(
     (percentileToScore(lstPercentile) * 0.3) +
     (percentileToScore(majorPercentile) * 0.3) +
     (percentileToScore(stablePercentile) * 0.2) +
     (percentileToScore(solPercentile) * 0.2)
-  ), 10);
+  ), 10), 100);
   
   // ==========================================================================
   // RELIABILITY - no_instant_dumps, conviction_ratio, tempo patterns
@@ -190,17 +190,20 @@ function calculateAgentFeatures(fairscaleData) {
   const tempoCV = f.tempo_cv || 0;
   const burstRatio = f.burst_ratio || 0;
   
-  const dumpScore = Math.max(noInstantDumps * 100, 10);
-  const convictionScore = Math.max(convictionRatio * 100, 10);
+  const dumpScore = Math.min(Math.max(noInstantDumps * 100, 10), 100);
+  const convictionScore = Math.min(Math.max(convictionRatio * 100, 10), 100);
   
   // Lower tempo CV and burst ratio = more predictable = better
-  const patternScore = tempoCV > 0 || burstRatio > 0 
-    ? Math.max(100 - (tempoCV * 20) - (burstRatio * 30), 10)
-    : 50; // Neutral if no data
+  const patternScore = Math.min(Math.max(
+    tempoCV > 0 || burstRatio > 0 
+      ? 100 - (tempoCV * 20) - (burstRatio * 30)
+      : 50,
+    10
+  ), 100);
   
-  const reliability = Math.max(Math.round(
+  const reliability = Math.min(Math.max(Math.round(
     (dumpScore * 0.4) + (convictionScore * 0.3) + (patternScore * 0.3)
-  ), 10);
+  ), 10), 100);
   
   // ==========================================================================
   // HISTORY - wallet_age_score, median_hold_days
@@ -209,10 +212,10 @@ function calculateAgentFeatures(fairscaleData) {
   const walletAgeScore = f.wallet_age_score || 0;
   const medianHoldDays = f.median_hold_days || 0;
   
-  const ageScore = Math.max(walletAgeScore, 10); // Already a score from FairScale
-  const holdScore = scale(medianHoldDays, 30, 1.5);
+  const ageScore = Math.min(Math.max(walletAgeScore, 10), 100);
+  const holdScore = Math.min(scale(medianHoldDays, 30, 1.5), 100);
   
-  const history = Math.max(Math.round((ageScore * 0.6) + (holdScore * 0.4)), 10);
+  const history = Math.min(Math.max(Math.round((ageScore * 0.6) + (holdScore * 0.4)), 10), 100);
   
   return {
     activity,
