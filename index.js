@@ -698,6 +698,195 @@ async function getOrCreateAgent(wallet) {
 }
 
 // =============================================================================
+// PUBLIC SCORING API — v1
+// =============================================================================
+// Designed for external consumption by 8004scan, SATI, AgentWallet, Solana
+// Foundation, or any platform that needs real-time wallet trust scoring.
+// No API key required (read-only). Rate-limit friendly.
+// =============================================================================
+
+/**
+ * GET /v1/score?wallet=<address>
+ * 
+ * Returns a FairScale trust score for any Solana wallet.
+ * Designed for integration by agent registries, marketplaces, and protocols.
+ * 
+ * Response:
+ * {
+ *   wallet: string,
+ *   fairscore: number (10-100),
+ *   tier: "bronze" | "silver" | "gold",
+ *   features: { activity, holdings, reliability, history },
+ *   signals: { ... },
+ *   meta: { provider, version, scored_at, cache_ttl }
+ * }
+ */
+app.get('/v1/score', async (req, res) => {
+  const { wallet } = req.query;
+
+  if (!wallet) {
+    return res.status(400).json({
+      error: 'missing_wallet',
+      message: 'Provide ?wallet=<solana_address>',
+      docs: 'https://docs.fairscale.xyz/api/v1/score',
+    });
+  }
+
+  if (wallet.length < 32 || wallet.length > 44) {
+    return res.status(400).json({
+      error: 'invalid_wallet',
+      message: 'Wallet address must be a valid Solana public key (32-44 chars)',
+    });
+  }
+
+  try {
+    const agent = await getOrCreateAgent(wallet);
+
+    if (!agent) {
+      return res.status(502).json({
+        error: 'scoring_unavailable',
+        message: 'Could not retrieve scoring data for this wallet. Try again shortly.',
+        wallet,
+      });
+    }
+
+    const score = agent.scores.agent_fairscore;
+    const tier = score >= 70 ? 'gold' : score >= 40 ? 'silver' : 'bronze';
+
+    // Check if this wallet is a registered 8004 agent
+    const erc8004 = agent.erc8004 || null;
+
+    res.json({
+      wallet,
+      fairscore: score,
+      tier,
+      features: {
+        activity: agent.features.activity,
+        holdings: agent.features.holdings,
+        reliability: agent.features.reliability,
+        history: agent.features.history,
+      },
+      signals: {
+        fairscore_base: agent.scores.fairscore_base,
+        said_score: agent.scores.said_score,
+        said_trust_tier: agent.scores.said_trust_tier,
+        attestations: agent.scores.attestations,
+        is_registered: agent.isRegistered,
+        is_verified: agent.isVerified,
+        is_erc8004: !!erc8004,
+      },
+      erc8004: erc8004 ? {
+        asset_id: erc8004.assetId,
+        name: erc8004.name,
+        services: erc8004.services,
+      } : null,
+      meta: {
+        provider: 'FairScale',
+        version: 'v1',
+        scored_at: agent.lastUpdated,
+        cache_ttl: 300,
+        docs: 'https://docs.fairscale.xyz/api/v1',
+      }
+    });
+  } catch (e) {
+    console.error('v1/score error:', e.message);
+    res.status(500).json({
+      error: 'internal_error',
+      message: 'Scoring failed. Please retry.',
+    });
+  }
+});
+
+/**
+ * POST /v1/score/batch
+ * 
+ * Score multiple wallets in one request (max 25).
+ * Useful for directory pages, leaderboards, portfolio views.
+ * 
+ * Body: { wallets: ["addr1", "addr2", ...] }
+ */
+app.post('/v1/score/batch', async (req, res) => {
+  const { wallets } = req.body;
+
+  if (!wallets || !Array.isArray(wallets) || wallets.length === 0) {
+    return res.status(400).json({
+      error: 'missing_wallets',
+      message: 'Provide { wallets: ["addr1", "addr2", ...] }',
+    });
+  }
+
+  if (wallets.length > 25) {
+    return res.status(400).json({
+      error: 'too_many_wallets',
+      message: 'Maximum 25 wallets per batch request',
+    });
+  }
+
+  const results = [];
+
+  for (const wallet of wallets) {
+    if (!wallet || wallet.length < 32 || wallet.length > 44) {
+      results.push({ wallet, error: 'invalid_wallet' });
+      continue;
+    }
+
+    try {
+      const agent = await getOrCreateAgent(wallet);
+      if (!agent) {
+        results.push({ wallet, error: 'scoring_unavailable' });
+        continue;
+      }
+
+      const score = agent.scores.agent_fairscore;
+      results.push({
+        wallet,
+        fairscore: score,
+        tier: score >= 70 ? 'gold' : score >= 40 ? 'silver' : 'bronze',
+        features: {
+          activity: agent.features.activity,
+          holdings: agent.features.holdings,
+          reliability: agent.features.reliability,
+          history: agent.features.history,
+        },
+      });
+    } catch (e) {
+      results.push({ wallet, error: 'scoring_failed' });
+    }
+  }
+
+  res.json({
+    total: wallets.length,
+    scored: results.filter(r => !r.error).length,
+    results,
+    meta: {
+      provider: 'FairScale',
+      version: 'v1',
+      scored_at: new Date().toISOString(),
+    }
+  });
+});
+
+/**
+ * GET /v1/health
+ * 
+ * Health check for monitoring and integration testing.
+ */
+app.get('/v1/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'FairScale Scoring API',
+    version: 'v1',
+    uptime: Math.floor(process.uptime()),
+    registry: {
+      agents: REGISTRY.agents.size,
+      erc8004: REGISTRY.erc8004Agents.size,
+      services: REGISTRY.services.size,
+    },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// =============================================================================
 // ROUTES
 // =============================================================================
 
@@ -706,8 +895,15 @@ app.get('/', (req, res) => {
     service: 'FairScale Agent Registry',
     version: '10.0.0',
     description: 'The Trust & Discovery Layer for Solana AI Agents',
+    api: {
+      v1: {
+        'GET /v1/score?wallet=': 'Score any Solana wallet (public, no auth)',
+        'POST /v1/score/batch': 'Score up to 25 wallets in one call',
+        'GET /v1/health': 'API health check',
+      }
+    },
     endpoints: {
-      'GET /score': 'Get agent score by wallet',
+      'GET /score': 'Get agent score by wallet (legacy)',
       'POST /register': 'Register agent',
       'POST /verify': 'Verify payment',
       'POST /service': 'Register x402 service',
