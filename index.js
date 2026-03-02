@@ -488,6 +488,44 @@ app.get('/directory', (req, res) => {
   res.json({ total: agents.length, agents });
 });
 
+// Bulk import agents (admin)
+app.post('/admin/bulk-import', async (req, res) => {
+  const { wallets, apiKey } = req.body;
+  
+  // Simple API key check - change this to your own secret
+  if (apiKey !== process.env.ADMIN_API_KEY) {
+    return res.status(401).json({ error: 'Invalid API key' });
+  }
+  
+  if (!wallets || !Array.isArray(wallets) || wallets.length === 0) {
+    return res.status(400).json({ error: 'wallets must be a non-empty array' });
+  }
+  
+  const results = { success: [], failed: [] };
+  
+  for (const wallet of wallets) {
+    try {
+      const agent = await getOrCreateAgent(wallet);
+      if (agent) {
+        results.success.push({
+          wallet,
+          score: agent.scores.agent_fairscore
+        });
+      } else {
+        results.failed.push({ wallet, reason: 'Could not fetch data' });
+      }
+    } catch (e) {
+      results.failed.push({ wallet, reason: e.message });
+    }
+  }
+  
+  res.json({
+    imported: results.success.length,
+    failed: results.failed.length,
+    results
+  });
+});
+
 app.get('/stats', (req, res) => {
   res.json({
     agents: REGISTRY.agents.size,
