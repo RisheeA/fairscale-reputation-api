@@ -19,7 +19,10 @@ const CONFIG = {
   PAYMENT_ADDRESS: 'fairAUEuR1SCcHL254Vb3F3XpUWLruJ2a11f6QfANEN',
   USDC_MINT: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
   VERIFICATION_AMOUNT: 5,
-  PORT: process.env.PORT || 8080
+  PORT: process.env.PORT || 8080,
+  // ERC-8004 / Solana Agent Registry
+  ERC8004_REGISTRY_PROGRAM: '8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ',
+  ERC8004_ATOM_PROGRAM: 'AToMw53aiPQ8j7iHVb4fGt6nzUNxUhcPc3tbPBZuzVVb',
 };
 
 // =============================================================================
@@ -30,7 +33,9 @@ const REGISTRY = {
   agents: new Map(),
   registeredAgents: new Map(),
   services: new Map(),
-  verifiedWallets: new Map()
+  verifiedWallets: new Map(),
+  erc8004Agents: new Map(),  // 8004 registry agents keyed by asset pubkey
+  lastErc8004Sync: null,
 };
 
 // =============================================================================
@@ -64,6 +69,348 @@ async function getSAIDData(wallet) {
     return null;
   }
 }
+
+// =============================================================================
+// ERC-8004 SOLANA AGENT REGISTRY CLIENT
+// =============================================================================
+// Queries the on-chain 8004 agent registry via Helius DAS API (Metaplex Core
+// NFTs) and resolves IPFS metadata. Zero SDK dependencies — pure fetch.
+// =============================================================================
+
+/**
+ * Fetch all agent NFTs from the 8004 registry collection via Helius DAS API.
+ * Uses getAssetsByGroup to find all Metaplex Core assets in the registry.
+ */
+async function fetch8004Agents(limit = 500) {
+  if (!CONFIG.HELIUS_API_KEY) {
+    console.warn('[8004 Sync] No HELIUS_API_KEY — skipping on-chain fetch');
+    return [];
+  }
+
+  const agents = [];
+  let page = 1;
+  let hasMore = true;
+
+  while (hasMore && agents.length < limit) {
+    try {
+      const response = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1,
+          method: 'getAssetsByAuthority',
+          params: {
+            authorityAddress: CONFIG.ERC8004_REGISTRY_PROGRAM,
+            page,
+            limit: 100,
+            displayOptions: { showUnverifiedCollections: true },
+          }
+        })
+      });
+
+      const data = await response.json();
+      const items = data.result?.items || [];
+
+      if (items.length === 0) {
+        hasMore = false;
+        break;
+      }
+
+      for (const item of items) {
+        try {
+          const agent = parse8004Asset(item);
+          if (agent) agents.push(agent);
+        } catch (e) {
+          // Skip malformed assets
+        }
+      }
+
+      page++;
+      // Rate limit courtesy
+      await new Promise(r => setTimeout(r, 150));
+    } catch (e) {
+      console.error('[8004 Sync] DAS fetch error:', e.message);
+      hasMore = false;
+    }
+  }
+
+  return agents;
+}
+
+/**
+ * Parse a Helius DAS asset into a normalized 8004 agent object.
+ */
+function parse8004Asset(item) {
+  if (!item?.id) return null;
+
+  const content = item.content || {};
+  const metadata = content.metadata || {};
+  const jsonUri = content.json_uri || '';
+
+  // Extract owner wallet (the agent's authority/owner)
+  const owner = item.ownership?.owner || null;
+
+  return {
+    assetId: item.id,
+    wallet: owner,
+    name: metadata.name || null,
+    description: metadata.description || null,
+    image: content.links?.image || metadata.image || null,
+    jsonUri,
+    // We'll resolve full metadata from IPFS/URI in enrichment step
+    services: [],
+    skills: [],
+    rawMetadata: null,
+    source: 'erc8004',
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Resolve an agent's registration file from its URI (IPFS or HTTPS).
+ * Returns the parsed JSON or null on failure.
+ */
+async function resolve8004Metadata(uri) {
+  if (!uri) return null;
+
+  try {
+    // Convert IPFS URIs to HTTP gateway
+    let url = uri;
+    if (uri.startsWith('ipfs://')) {
+      const cid = uri.replace('ipfs://', '');
+      url = `https://gateway.pinata.cloud/ipfs/${cid}`;
+    }
+
+    const response = await fetch(url, {
+      headers: { 'accept': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!response.ok) return null;
+    return await response.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Alternative: fetch agents by searching for all assets owned by the registry
+ * program using getAssetsByGroup with the collection address.
+ * Falls back to getProgramAccounts if DAS is unavailable.
+ */
+async function fetch8004AgentsByCollection() {
+  if (!CONFIG.HELIUS_API_KEY) return [];
+
+  try {
+    // First, find collections created by the registry
+    const response = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1,
+        method: 'searchAssets',
+        params: {
+          // Search for assets linked to the 8004 program
+          grouping: ['collection', CONFIG.ERC8004_REGISTRY_PROGRAM],
+          page: 1,
+          limit: 100,
+        }
+      })
+    });
+
+    const data = await response.json();
+    return (data.result?.items || []).map(parse8004Asset).filter(Boolean);
+  } catch (e) {
+    console.error('[8004 Sync] Collection search error:', e.message);
+    return [];
+  }
+}
+
+/**
+ * Full sync: fetch 8004 agents, resolve metadata, extract wallets,
+ * and import into FairScale registry for scoring.
+ */
+async function syncFrom8004() {
+  console.log('[8004 Sync] Starting...');
+
+  try {
+    // Try DAS API first (fastest, most comprehensive)
+    let rawAgents = await fetch8004Agents(500);
+
+    // Fallback: try collection-based search
+    if (rawAgents.length === 0) {
+      rawAgents = await fetch8004AgentsByCollection();
+    }
+
+    if (rawAgents.length === 0) {
+      console.log('[8004 Sync] No agents found via DAS. Will retry next cycle.');
+      return;
+    }
+
+    console.log(`[8004 Sync] Found ${rawAgents.length} raw agents, enriching...`);
+
+    let imported = 0;
+    let enriched = 0;
+    let failed = 0;
+
+    for (const agent of rawAgents) {
+      try {
+        // Store the raw 8004 agent
+        REGISTRY.erc8004Agents.set(agent.assetId, agent);
+
+        // Resolve IPFS metadata to get full registration file
+        if (agent.jsonUri) {
+          const meta = await resolve8004Metadata(agent.jsonUri);
+          if (meta) {
+            agent.rawMetadata = meta;
+            agent.name = meta.name || agent.name;
+            agent.description = meta.description || agent.description;
+            agent.image = meta.image || agent.image;
+
+            // Extract services from 8004 registration file
+            if (Array.isArray(meta.services)) {
+              agent.services = meta.services.map(s => ({
+                name: s.name || s.type || 'unknown',
+                endpoint: s.endpoint || s.value || '',
+              }));
+            }
+
+            // Extract skills/domains if present
+            if (Array.isArray(meta.skills)) agent.skills = meta.skills;
+
+            enriched++;
+          }
+        }
+
+        // If the agent has a wallet, score it with FairScale
+        if (agent.wallet) {
+          const existing = REGISTRY.agents.get(agent.wallet);
+          if (!existing || Date.now() - new Date(existing.lastUpdated).getTime() > 600000) {
+            const scored = await getOrCreateAgent(agent.wallet);
+            if (scored) {
+              // Tag it as an 8004 agent
+              scored.erc8004 = {
+                assetId: agent.assetId,
+                name: agent.name,
+                services: agent.services,
+                skills: agent.skills,
+              };
+              imported++;
+            }
+          } else {
+            // Update existing with 8004 metadata
+            existing.erc8004 = {
+              assetId: agent.assetId,
+              name: agent.name,
+              services: agent.services,
+              skills: agent.skills,
+            };
+            imported++;
+          }
+        }
+
+        // Rate limit: don't hammer FairScale API
+        await new Promise(r => setTimeout(r, 250));
+      } catch (e) {
+        failed++;
+      }
+    }
+
+    console.log(`[8004 Sync] Complete: ${imported} scored, ${enriched} metadata resolved, ${failed} failed out of ${rawAgents.length} total`);
+    REGISTRY.lastErc8004Sync = new Date().toISOString();
+  } catch (e) {
+    console.error('[8004 Sync] Error:', e.message);
+  }
+}
+
+// =============================================================================
+// 8004 ROUTES
+// =============================================================================
+
+// List all 8004 agents we've synced (raw from registry)
+app.get('/8004/agents', (req, res) => {
+  const agents = Array.from(REGISTRY.erc8004Agents.values());
+  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+  const offset = parseInt(req.query.offset) || 0;
+
+  const page = agents.slice(offset, offset + limit);
+
+  res.json({
+    source: 'solana-agent-registry-8004',
+    total: agents.length,
+    limit,
+    offset,
+    lastSync: REGISTRY.lastErc8004Sync,
+    agents: page.map(a => ({
+      assetId: a.assetId,
+      wallet: a.wallet,
+      name: a.name,
+      description: a.description,
+      image: a.image,
+      services: a.services,
+      skills: a.skills,
+      source: a.source,
+      fetchedAt: a.fetchedAt,
+    }))
+  });
+});
+
+// Get a single 8004 agent by asset ID with FairScale scoring
+app.get('/8004/agent/:assetId', async (req, res) => {
+  const { assetId } = req.params;
+
+  const cached = REGISTRY.erc8004Agents.get(assetId);
+  if (!cached) {
+    return res.status(404).json({ error: 'Agent not found in 8004 registry' });
+  }
+
+  // If the agent has a wallet, include FairScale score
+  let fairscaleScore = null;
+  if (cached.wallet) {
+    const agent = await getOrCreateAgent(cached.wallet);
+    if (agent) {
+      fairscaleScore = {
+        agent_fairscore: agent.scores.agent_fairscore,
+        fairscore_base: agent.scores.fairscore_base,
+        features: agent.features,
+        descriptions: agent.descriptions,
+      };
+    }
+  }
+
+  res.json({
+    source: 'solana-agent-registry-8004',
+    agent: {
+      assetId: cached.assetId,
+      wallet: cached.wallet,
+      name: cached.name,
+      description: cached.description,
+      image: cached.image,
+      services: cached.services,
+      skills: cached.skills,
+      rawMetadata: cached.rawMetadata,
+    },
+    fairscale: fairscaleScore,
+  });
+});
+
+// Trigger a manual 8004 sync (admin)
+app.post('/admin/sync-8004', async (req, res) => {
+  const { apiKey } = req.body;
+  if (apiKey !== process.env.ADMIN_API_KEY) {
+    return res.status(401).json({ error: 'Invalid API key' });
+  }
+
+  // Run sync in background, respond immediately
+  syncFrom8004();
+
+  res.json({
+    success: true,
+    message: '8004 sync started',
+    currentCount: REGISTRY.erc8004Agents.size,
+    lastSync: REGISTRY.lastErc8004Sync,
+  });
+});
 
 // =============================================================================
 // PAYMENT VERIFICATION
@@ -357,14 +704,26 @@ async function getOrCreateAgent(wallet) {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '9.1.0',
+    version: '10.0.0',
+    description: 'The Trust & Discovery Layer for Solana AI Agents',
     endpoints: {
-      'GET /score': 'Get agent score',
+      'GET /score': 'Get agent score by wallet',
       'POST /register': 'Register agent',
       'POST /verify': 'Verify payment',
       'POST /service': 'Register x402 service',
       'GET /services': 'List services',
-      'GET /directory': 'List agents'
+      'GET /directory': 'List all agents (supports ?source=8004|fairscale)',
+      'GET /stats': 'Registry statistics',
+      'GET /8004/agents': 'List agents from Solana Agent Registry (ERC-8004)',
+      'GET /8004/agent/:assetId': 'Get 8004 agent with FairScale score',
+      'POST /admin/sync-8004': 'Trigger 8004 sync (admin)',
+      'POST /admin/sync-said': 'Trigger SAID sync (admin)',
+      'POST /admin/bulk-import': 'Bulk import wallets (admin)',
+    },
+    integrations: {
+      erc8004: 'Solana Agent Registry (8004-solana)',
+      said: 'SAID Protocol',
+      fairscale: 'FairScale Scoring Engine',
     }
   });
 });
@@ -473,16 +832,25 @@ app.get('/services', (req, res) => {
 });
 
 app.get('/directory', (req, res) => {
+  const source = req.query.source; // Optional filter: 'fairscale', '8004', or omit for all
+  
   const agents = Array.from(REGISTRY.agents.values())
-    .filter(a => a.isRegistered)
+    .filter(a => a.isRegistered || a.erc8004)
+    .filter(a => {
+      if (source === '8004') return !!a.erc8004;
+      if (source === 'fairscale') return a.isRegistered && !a.erc8004;
+      return true;
+    })
     .sort((a, b) => b.scores.agent_fairscore - a.scores.agent_fairscore)
     .slice(0, 100)
     .map(a => ({
       wallet: a.wallet,
-      name: a.name || `Agent ${a.wallet.slice(0, 8)}...`,
+      name: a.erc8004?.name || a.name || `Agent ${a.wallet.slice(0, 8)}...`,
       agent_fairscore: a.scores.agent_fairscore,
       isVerified: a.isVerified,
-      services: a.services.length
+      services: a.services.length + (a.erc8004?.services?.length || 0),
+      source: a.erc8004 ? 'erc8004' : 'fairscale',
+      erc8004AssetId: a.erc8004?.assetId || null,
     }));
   
   res.json({ total: agents.length, agents });
@@ -591,7 +959,10 @@ app.get('/stats', (req, res) => {
     agents: REGISTRY.agents.size,
     registered: REGISTRY.registeredAgents.size,
     verified: REGISTRY.verifiedWallets.size,
-    services: REGISTRY.services.size
+    services: REGISTRY.services.size,
+    erc8004Agents: REGISTRY.erc8004Agents.size,
+    lastErc8004Sync: REGISTRY.lastErc8004Sync,
+    lastSaidSync: REGISTRY.lastSync || null,
   });
 });
 
@@ -652,11 +1023,18 @@ async function syncFromSAID() {
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Registry v9.2 on port ${CONFIG.PORT}`);
+  console.log(`FairScale Registry v10.0 on port ${CONFIG.PORT}`);
+  console.log(`  Integrations: FairScale API, SAID Protocol, ERC-8004 (Solana Agent Registry)`);
   
   // Sync from SAID on startup (after 5 second delay)
   setTimeout(syncFromSAID, 5000);
   
-  // Re-sync daily (every 24 hours)
+  // Sync from 8004 on startup (after 15 second delay — let SAID go first)
+  setTimeout(syncFrom8004, 15000);
+  
+  // Re-sync SAID daily (every 24 hours)
   setInterval(syncFromSAID, 24 * 60 * 60 * 1000);
+  
+  // Re-sync 8004 every 6 hours (more agents, higher value)
+  setInterval(syncFrom8004, 6 * 60 * 60 * 1000);
 });
