@@ -1,7 +1,7 @@
 {
   "name": "fairscale-registry",
-  "version": "6.0.0",
-  "description": "The Trust & Discovery Layer for Solana's Agentic Economy",
+  "version": "10.0.0",
+  "description": "The Trust & Discovery Layer for Solana's Agentic Economy — integrates FairScale scoring, SAID Protocol, and ERC-8004 Solana Agent Registry",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -25,6 +25,6 @@
     "type": "git",
     "url": "https://github.com/fairscale-xyz/registry.git"
   },
-  "keywords": ["fairscale", "solana", "agents", "reputation", "x402", "said"],
+  "keywords": ["fairscale", "solana", "agents", "reputation", "x402", "said", "erc8004", "8004"],
   "license": "MIT"
 }
