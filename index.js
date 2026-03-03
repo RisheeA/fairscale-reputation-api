@@ -23,6 +23,10 @@ const CONFIG = {
   // ERC-8004 / Solana Agent Registry
   ERC8004_REGISTRY_PROGRAM: '8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ',
   ERC8004_ATOM_PROGRAM: 'AToMw53aiPQ8j7iHVb4fGt6nzUNxUhcPc3tbPBZuzVVb',
+  SAID_PROGRAM: '5dpw6KEQPn248pnkkaYyWfHwu2nfb3LUMbTucb6LaA8G',
+  CLAWKEY_API: 'https://clawkey.ai/api',
+  MOLTBOOK_API: 'https://www.moltbook.com/api/v1',
+  MOLTBOOK_APP_KEY: process.env.MOLTBOOK_APP_KEY || '',
 };
 
 // =============================================================================
@@ -34,8 +38,11 @@ const REGISTRY = {
   registeredAgents: new Map(),
   services: new Map(),
   verifiedWallets: new Map(),
-  erc8004Agents: new Map(),  // 8004 registry agents keyed by asset pubkey
+  erc8004Agents: new Map(),
+  saidAgents: new Map(),
   lastErc8004Sync: null,
+  lastClawKeySync: null,
+  lastMoltbookSync: null,
 };
 
 // =============================================================================
@@ -67,6 +74,159 @@ async function getSAIDData(wallet) {
   } catch (e) {
     console.error('SAID error:', e.message);
     return null;
+  }
+}
+
+
+
+// =============================================================================
+// CLAWKEY (VeryAI) - HUMAN VERIFICATION
+// =============================================================================
+
+async function getClawKeyVerification(deviceIdOrPubkey) {
+  try {
+    const response = await fetch(
+      `${CONFIG.CLAWKEY_API}/verify/${encodeURIComponent(deviceIdOrPubkey)}`,
+      { headers: { 'accept': 'application/json' }, signal: AbortSignal.timeout(5000) }
+    );
+    if (!response.ok) return null;
+    const data = await response.json();
+    return {
+      registered: data.registered || false,
+      verified: data.verified || false,
+      humanId: data.humanId || null,
+      registeredAt: data.registeredAt || null,
+    };
+  } catch (e) {
+    console.error('[ClawKey] Error:', e.message);
+    return null;
+  }
+}
+
+// =============================================================================
+// MOLTBOOK - AGENT SOCIAL REPUTATION
+// =============================================================================
+
+async function getMoltbookProfile(agentName) {
+  if (!CONFIG.MOLTBOOK_APP_KEY || !agentName) return null;
+  try {
+    const response = await fetch(
+      `${CONFIG.MOLTBOOK_API}/agents/lookup?name=${encodeURIComponent(agentName)}`,
+      { 
+        headers: { 
+          'accept': 'application/json',
+          'X-Moltbook-App-Key': CONFIG.MOLTBOOK_APP_KEY
+        },
+        signal: AbortSignal.timeout(5000)
+      }
+    );
+    if (!response.ok) return null;
+    const data = await response.json();
+    if (!data || !data.agent) return null;
+    const agent = data.agent;
+    return {
+      id: agent.id || null,
+      name: agent.name || agentName,
+      karma: agent.karma || 0,
+      isClaimed: agent.is_claimed || false,
+      followerCount: agent.follower_count || 0,
+      stats: { posts: agent.stats?.posts || 0, comments: agent.stats?.comments || 0 },
+      owner: {
+        xHandle: agent.owner?.x_handle || null,
+        xVerified: agent.owner?.x_verified || false,
+        xFollowerCount: agent.owner?.x_follower_count || 0,
+      },
+    };
+  } catch (e) {
+    console.error('[Moltbook] Error:', e.message);
+    return null;
+  }
+}
+
+// =============================================================================
+// SAID PROTOCOL - ON-CHAIN REGISTRY SYNC VIA HELIUS
+// =============================================================================
+
+function encodeBase58(bytes) {
+  const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  let num = BigInt('0x' + Buffer.from(bytes).toString('hex'));
+  let str = '';
+  while (num > 0n) {
+    str = ALPHABET[Number(num % 58n)] + str;
+    num = num / 58n;
+  }
+  for (const byte of bytes) {
+    if (byte === 0) str = '1' + str;
+    else break;
+  }
+  return str;
+}
+
+async function fetchSAIDAgentsOnChain(limit = 500) {
+  if (!CONFIG.HELIUS_API_KEY) {
+    console.warn('[SAID On-Chain] No HELIUS_API_KEY - skipping');
+    return [];
+  }
+  try {
+    const response = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1,
+        method: 'getProgramAccounts',
+        params: [
+          CONFIG.SAID_PROGRAM,
+          { encoding: 'base64', commitment: 'confirmed' }
+        ]
+      })
+    });
+    if (!response.ok) {
+      console.error('[SAID On-Chain] RPC error:', response.status);
+      return [];
+    }
+    const result = await response.json();
+    if (result?.error) {
+      console.error('[SAID On-Chain] RPC returned error:', result.error?.message || JSON.stringify(result.error));
+      return [];
+    }
+    const accounts = result?.result || [];
+    console.log(`[SAID On-Chain] Found ${accounts.length} program accounts`);
+    
+    const agents = [];
+    for (const account of accounts) {
+      try {
+        const data = account.account?.data;
+        if (Array.isArray(data) && data[0]) {
+          const buffer = Buffer.from(data[0], 'base64');
+          // SAID Anchor accounts: try multiple known layouts
+          // Standard Anchor: 8-byte discriminator + 32-byte owner pubkey
+          // Also try raw (pubkey at offset 0) and alternate (offset 40)
+          const layouts = [
+            { offset: 8, label: 'anchor-default' },
+            { offset: 0, label: 'raw' },
+            { offset: 40, label: 'anchor-alt' },
+          ];
+          for (const layout of layouts) {
+            if (buffer.length >= layout.offset + 32) {
+              const ownerBytes = buffer.slice(layout.offset, layout.offset + 32);
+              const allZero = ownerBytes.every(b => b === 0);
+              const allFF = ownerBytes.every(b => b === 0xFF);
+              if (allZero || allFF) continue;
+              const ownerWallet = encodeBase58(ownerBytes);
+              if (ownerWallet && ownerWallet.length >= 32 && ownerWallet.length <= 44) {
+                agents.push({ pda: account.pubkey, wallet: ownerWallet, dataLength: buffer.length, layout: layout.label });
+                break;
+              }
+            }
+          }
+        }
+      } catch (e) { /* skip malformed account */ }
+      if (agents.length >= limit) break;
+    }
+    return agents;
+  } catch (e) {
+    console.error('[SAID On-Chain] Error:', e.message);
+    return [];
   }
 }
 
@@ -608,7 +768,7 @@ function getFeatureDescription(feature, value) {
 // AGENT FAIRSCORE CALCULATION
 // =============================================================================
 
-function calculateAgentFairScore(fairscaleData, features, saidData, wallet) {
+function calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications = {}) {
   // FairScale's score (40%)
   const fsScore = fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0;
   const fsComponent = fsScore * 0.40;
@@ -633,7 +793,18 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet) {
   if (REGISTRY.registeredAgents.has(wallet)) bonuses += 2;
   if (REGISTRY.verifiedWallets.has(wallet)) bonuses += 5;
   
-  const total = fsComponent + featureComponent + saidComponent + Math.min(bonuses, 15);
+  // ClawKey human verification (+8 - strongest Sybil signal)
+  if (verifications.clawkey?.verified) bonuses += 8;
+  // Moltbook social reputation (+4 if karma>100, +2 if >50)
+  if (verifications.moltbook?.karma > 100) bonuses += 4;
+  else if (verifications.moltbook?.karma > 50) bonuses += 2;
+  if (verifications.moltbook?.owner?.xVerified) bonuses += 2;
+  // SAID on-chain registration (+3)
+  if (REGISTRY.saidAgents.has(wallet)) bonuses += 3;
+  // 8004 registration (+3)
+  if (REGISTRY.erc8004Agents.has(wallet)) bonuses += 3;
+  
+  const total = fsComponent + featureComponent + saidComponent + Math.min(bonuses, 20);
   
   // Minimum score is 10
   return Math.max(Math.min(Math.round(total), 100), 10);
@@ -651,6 +822,8 @@ async function getOrCreateAgent(wallet) {
     }
   }
   
+  const regData = REGISTRY.registeredAgents.get(wallet);
+  
   const [fairscaleData, saidData] = await Promise.all([
     getFairScaleScore(wallet),
     getSAIDData(wallet)
@@ -658,9 +831,17 @@ async function getOrCreateAgent(wallet) {
   
   if (!fairscaleData && !saidData) return null;
   
+  // Fetch optional verification signals
+  const verifications = {};
+  try {
+    const deviceId = regData?.clawkeyDeviceId || null;
+    if (deviceId) verifications.clawkey = await getClawKeyVerification(deviceId);
+    const moltbookName = regData?.moltbookName || null;
+    if (moltbookName) verifications.moltbook = await getMoltbookProfile(moltbookName);
+  } catch (e) { console.error('[Verifications]', e.message); }
+  
   const features = calculateAgentFeatures(fairscaleData);
-  const agentFairScore = calculateAgentFairScore(fairscaleData, features, saidData, wallet);
-  const regData = REGISTRY.registeredAgents.get(wallet);
+  const agentFairScore = calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications);
   
   const agent = {
     wallet,
@@ -680,6 +861,12 @@ async function getOrCreateAgent(wallet) {
       holdings: features.holdings,
       reliability: features.reliability,
       history: features.history
+    },
+    verifications: {
+      clawkey: verifications.clawkey ? { verified: verifications.clawkey.verified, humanId: verifications.clawkey.humanId } : null,
+      moltbook: verifications.moltbook ? { karma: verifications.moltbook.karma, isClaimed: verifications.moltbook.isClaimed, ownerXVerified: verifications.moltbook.owner?.xVerified || false } : null,
+      said_onchain: REGISTRY.saidAgents.has(wallet),
+      erc8004: !!REGISTRY.erc8004Agents.has(wallet),
     },
     descriptions: {
       activity: getFeatureDescription('activity', features.activity),
@@ -1034,6 +1221,7 @@ app.get('/directory', (req, res) => {
     .filter(a => a.isRegistered || a.erc8004)
     .filter(a => {
       if (source === '8004') return !!a.erc8004;
+      if (source === 'said') return REGISTRY.saidAgents.has(a.wallet);
       if (source === 'fairscale') return a.isRegistered && !a.erc8004;
       return true;
     })
@@ -1045,8 +1233,14 @@ app.get('/directory', (req, res) => {
       agent_fairscore: a.scores.agent_fairscore,
       isVerified: a.isVerified,
       services: a.services.length + (a.erc8004?.services?.length || 0),
-      source: a.erc8004 ? 'erc8004' : 'fairscale',
+      source: a.erc8004 ? 'erc8004' : (REGISTRY.saidAgents.has(a.wallet) ? 'said' : 'fairscale'),
       erc8004AssetId: a.erc8004?.assetId || null,
+      badges: {
+        humanVerified: a.verifications?.clawkey?.verified || false,
+        moltbookActive: (a.verifications?.moltbook?.karma || 0) > 50,
+        saidOnChain: a.verifications?.said_onchain || REGISTRY.saidAgents.has(a.wallet),
+        erc8004: !!a.erc8004,
+      },
     }));
   
   res.json({ total: agents.length, agents });
@@ -1099,34 +1293,31 @@ app.post('/admin/sync-said', async (req, res) => {
   }
   
   try {
-    // Fetch all agents from SAID
-    const saidResponse = await fetch(`${CONFIG.SAID_API}/api/agents?limit=500`);
-    if (!saidResponse.ok) {
-      return res.status(500).json({ error: 'Failed to fetch from SAID API' });
-    }
+    // Fetch all agents from SAID on-chain registry via Helius
+    const onChainAgents = await fetchSAIDAgentsOnChain(500);
     
-    const saidData = await saidResponse.json();
-    const agents = saidData.agents || saidData.data || saidData || [];
-    
-    if (!Array.isArray(agents)) {
-      return res.status(500).json({ error: 'Unexpected SAID response format', raw: saidData });
+    if (onChainAgents.length === 0) {
+      return res.json({ source: 'SAID Protocol (on-chain)', total_found: 0, note: 'No PDAs found. Ensure HELIUS_API_KEY is set.' });
     }
     
     const results = { success: [], failed: [] };
     
-    for (const agent of agents) {
-      const wallet = agent.wallet || agent.walletAddress || agent.address;
+    for (const agent of onChainAgents) {
+      const wallet = agent.wallet;
       if (!wallet) {
-        results.failed.push({ agent, reason: 'No wallet found' });
+        results.failed.push({ pda: agent.pda, reason: 'Could not extract wallet' });
         continue;
       }
+      
+      REGISTRY.saidAgents.set(wallet, { pda: agent.pda, layout: agent.layout, syncedAt: new Date().toISOString() });
       
       try {
         const imported = await getOrCreateAgent(wallet);
         if (imported) {
           results.success.push({
             wallet,
-            name: agent.name || imported.name,
+            pda: agent.pda,
+            name: imported.name,
             score: imported.scores.agent_fairscore
           });
         } else {
@@ -1138,8 +1329,8 @@ app.post('/admin/sync-said', async (req, res) => {
     }
     
     res.json({
-      source: 'SAID Protocol',
-      total_found: agents.length,
+      source: 'SAID Protocol (on-chain)',
+      total_found: onChainAgents.length,
       imported: results.success.length,
       failed: results.failed.length,
       results
@@ -1157,8 +1348,10 @@ app.get('/stats', (req, res) => {
     verified: REGISTRY.verifiedWallets.size,
     services: REGISTRY.services.size,
     erc8004Agents: REGISTRY.erc8004Agents.size,
+    saidAgents: REGISTRY.saidAgents.size,
     lastErc8004Sync: REGISTRY.lastErc8004Sync,
     lastSaidSync: REGISTRY.lastSync || null,
+    verificationProviders: { clawkey: 'active', said_onchain: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key', erc8004: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key' },
   });
 });
 
@@ -1167,48 +1360,32 @@ app.get('/stats', (req, res) => {
 // =============================================================================
 
 async function syncFromSAID() {
-  console.log('[SAID Sync] Starting...');
+  console.log('[SAID Sync] Starting (on-chain PDA discovery via Helius)...');
   
   try {
-    const saidResponse = await fetch(`${CONFIG.SAID_API}/api/agents?limit=500`);
-    if (!saidResponse.ok) {
-      console.error('[SAID Sync] Failed to fetch:', saidResponse.status);
-      return;
-    }
-    
-    const saidData = await saidResponse.json();
-    const agents = saidData.agents || saidData.data || saidData || [];
-    
-    if (!Array.isArray(agents)) {
-      console.error('[SAID Sync] Unexpected response format');
-      return;
-    }
+    const onChainAgents = await fetchSAIDAgentsOnChain(500);
+    console.log(`[SAID Sync] Found ${onChainAgents.length} on-chain agents`);
     
     let imported = 0;
     let failed = 0;
     
-    for (const agent of agents) {
-      const wallet = agent.wallet || agent.walletAddress || agent.address;
-      if (!wallet) {
-        failed++;
-        continue;
-      }
-      
+    for (const agent of onChainAgents) {
+      if (!agent.wallet) { failed++; continue; }
+      REGISTRY.saidAgents.set(agent.wallet, { pda: agent.pda, syncedAt: new Date().toISOString() });
       try {
-        const result = await getOrCreateAgent(wallet);
+        const result = await getOrCreateAgent(agent.wallet);
         if (result) imported++;
         else failed++;
-      } catch (e) {
-        failed++;
-      }
-      
-      // Small delay to avoid hammering APIs
+      } catch (e) { failed++; }
       await new Promise(r => setTimeout(r, 200));
     }
     
-    console.log(`[SAID Sync] Complete: ${imported} imported, ${failed} failed`);
-    REGISTRY.lastSync = new Date().toISOString();
+    // Note: SAID REST API (/api/agents) removed — on-chain PDA discovery is the
+    // canonical source. Individual wallet enrichment happens via /api/verify/{wallet}
+    // inside getOrCreateAgent() -> getSAIDData().
     
+    console.log(`[SAID Sync] Complete: ${imported} imported, ${failed} failed, ${REGISTRY.saidAgents.size} total`);
+    REGISTRY.lastSync = new Date().toISOString();
   } catch (e) {
     console.error('[SAID Sync] Error:', e.message);
   }
@@ -1219,8 +1396,8 @@ async function syncFromSAID() {
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Registry v10.0 on port ${CONFIG.PORT}`);
-  console.log(`  Integrations: FairScale API, SAID Protocol, ERC-8004 (Solana Agent Registry)`);
+  console.log(`FairScale Registry v12.0 on port ${CONFIG.PORT}`);
+  console.log(`  Integrations: FairScale API, SAID Protocol (on-chain PDA), ERC-8004, ClawKey (VeryAI)`);
   
   // Sync from SAID on startup (after 5 second delay)
   setTimeout(syncFromSAID, 5000);
