@@ -21,7 +21,6 @@ const CONFIG = {
   VERIFICATION_AMOUNT: 5,
   PORT: process.env.PORT || 8080,
   ERC8004_REGISTRY_PROGRAM: '8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ',
-  ERC8004_ATOM_PROGRAM: 'AToMw53aiPQ8j7iHVb4fGt6nzUNxUhcPc3tbPBZuzVVb',
   SAID_PROGRAM: '5dpw6KEQPn248pnkkaYyWfHwu2nfb3LUMbTucb6LaA8G',
   CLAWKEY_API: 'https://clawkey.ai/api',
 };
@@ -555,7 +554,7 @@ async function getOrCreateAgent(wallet) {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '12.3.0',
+    version: '12.4.0',
     description: 'The Trust & Discovery Layer for Solana AI Agents',
     api: { v1: { 'GET /v1/score?wallet=': 'Score any Solana wallet', 'POST /v1/score/batch': 'Score up to 25 wallets', 'GET /v1/health': 'Health check' } },
     endpoints: {
@@ -675,23 +674,44 @@ app.get('/directory', (req, res) => {
     .filter(a => a.isRegistered || a.erc8004 || REGISTRY.saidAgents.has(a.wallet))
     .filter(a => {
       if (source === '8004') return !!a.erc8004;
-      if (source === 'said') return REGISTRY.saidAgents.has(a.wallet) && !a.isRegistered && !a.erc8004;
-      if (source === 'fairscale') return a.isRegistered && !a.erc8004;
+      if (source === 'said') return REGISTRY.saidAgents.has(a.wallet);
+      if (source === 'fairscale') return a.isRegistered;
       return true;
     })
     .sort((a, b) => b.scores.agent_fairscore - a.scores.agent_fairscore)
     .slice(0, 1000)
-    .map(a => ({
-      wallet: a.wallet,
-      name: a.erc8004?.name || a.name || `Agent ${a.wallet.slice(0, 8)}...`,
-      agent_fairscore: a.scores.agent_fairscore,
-      isVerified: a.isVerified,
-      humanVerified: a.verifications?.clawkey?.verified || false,
-      services: a.services.length + (a.erc8004?.services?.length || 0),
-      source: a.erc8004 ? 'erc8004' : REGISTRY.saidAgents.has(a.wallet) ? 'said' : 'fairscale',
-      erc8004AssetId: a.erc8004?.assetId || null,
-      saidPda: REGISTRY.saidAgents.get(a.wallet)?.pda || null,
-    }));
+    .map(a => {
+      const onSaid = REGISTRY.saidAgents.has(a.wallet);
+      const on8004 = !!a.erc8004;
+      const sources = [];
+      if (onSaid) sources.push('said');
+      if (on8004) sources.push('erc8004');
+      if (a.isRegistered) sources.push('fairscale');
+
+      // Score boost breakdown
+      const boosts = {};
+      if (onSaid) boosts.said_onchain = '+3';
+      if (on8004) boosts.erc8004_registry = '+3';
+      if (a.isRegistered) boosts.fairscale_registered = '+2';
+      if (a.isVerified) boosts.payment_verified = '+5';
+      if (a.verifications?.clawkey?.verified) boosts.clawkey_human = '+8';
+      if (a.scores?.said_score > 0) boosts.said_reputation = `+${Math.min((a.scores.attestations || 0) * 5, 15)} (feedback)`;
+      if (a.scores?.said_trust_tier === 'high') boosts.said_trust = '+3';
+
+      return {
+        wallet: a.wallet,
+        name: a.erc8004?.name || a.name || `Agent ${a.wallet.slice(0, 8)}...`,
+        agent_fairscore: a.scores.agent_fairscore,
+        fairscore_base: a.scores.fairscore_base,
+        isVerified: a.isVerified,
+        humanVerified: a.verifications?.clawkey?.verified || false,
+        services: a.services.length + (a.erc8004?.services?.length || 0),
+        sources,
+        boosts,
+        said: onSaid ? { pda: REGISTRY.saidAgents.get(a.wallet)?.pda || null, score: a.scores.said_score, trustTier: a.scores.said_trust_tier, feedbackCount: a.scores.attestations } : null,
+        erc8004: on8004 ? { assetId: a.erc8004.assetId, name: a.erc8004.name, skills: a.erc8004.skills || [], services: a.erc8004.services || [] } : null,
+      };
+    });
   res.json({ total: agents.length, agents });
 });
 
@@ -757,10 +777,17 @@ app.post('/admin/bulk-import', async (req, res) => {
 // --- Stats ---
 
 app.get('/stats', (req, res) => {
+  // Count overlaps
+  let onBoth = 0;
+  for (const [wallet] of REGISTRY.saidAgents) {
+    const agent = REGISTRY.agents.get(wallet);
+    if (agent?.erc8004) onBoth++;
+  }
   res.json({
     agents: REGISTRY.agents.size, registered: REGISTRY.registeredAgents.size,
     verified: REGISTRY.verifiedWallets.size, services: REGISTRY.services.size,
     erc8004Agents: REGISTRY.erc8004Agents.size, saidAgents: REGISTRY.saidAgents.size,
+    onBothProtocols: onBoth,
     lastErc8004Sync: REGISTRY.lastErc8004Sync, lastSaidSync: REGISTRY.lastSaidSync,
     verificationProviders: { clawkey: 'active', said_onchain: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key', erc8004: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key' },
   });
@@ -771,7 +798,7 @@ app.get('/stats', (req, res) => {
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Registry v12.3 on port ${CONFIG.PORT}`);
+  console.log(`FairScale Registry v12.4 on port ${CONFIG.PORT}`);
   console.log(`  Integrations: FairScale API, SAID Protocol (on-chain PDA), ERC-8004, ClawKey (VeryAI)`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
