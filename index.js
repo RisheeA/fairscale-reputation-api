@@ -35,6 +35,7 @@ const REGISTRY = {
   services: new Map(),
   verifiedWallets: new Map(),
   erc8004Agents: new Map(),
+  erc8004ByWallet: new Map(),
   saidAgents: new Map(),
   lastErc8004Sync: null,
   lastSaidSync: null,
@@ -315,6 +316,7 @@ async function syncFrom8004() {
     for (const agent of rawAgents) {
       try {
         REGISTRY.erc8004Agents.set(agent.assetId, agent);
+        if (agent.wallet) REGISTRY.erc8004ByWallet.set(agent.wallet, agent);
         if (agent.jsonUri) {
           const meta = await resolve8004Metadata(agent.jsonUri);
           if (meta) {
@@ -602,8 +604,8 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
   // Registry & verification bonuses
   let bonuses = 0;
   if (REGISTRY.saidAgents.has(wallet)) bonuses += 3;
-  if (REGISTRY.erc8004Agents.has(wallet)) bonuses += 5;
-  if (REGISTRY.saidAgents.has(wallet) && REGISTRY.erc8004Agents.has(wallet)) bonuses += 3;
+  if (REGISTRY.erc8004ByWallet.has(wallet)) bonuses += 5;
+  if (REGISTRY.saidAgents.has(wallet) && REGISTRY.erc8004ByWallet.has(wallet)) bonuses += 3;
   if (saidData?.verified) bonuses += 3;
   if (saidData?.reputation?.trustTier === 'high') bonuses += 4;
   bonuses += Math.min((saidData?.reputation?.feedbackCount || 0) * 3, 12);
@@ -617,7 +619,7 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
 
 function getRecommendationTier(score, verifications, wallet) {
   const isHumanVerified = verifications?.clawkey?.verified || false;
-  const on8004 = REGISTRY.erc8004Agents.has(wallet);
+  const on8004 = REGISTRY.erc8004ByWallet.has(wallet);
   const onSaid = REGISTRY.saidAgents.has(wallet);
   const registryCount = (on8004 ? 1 : 0) + (onSaid ? 1 : 0);
 
@@ -663,10 +665,14 @@ async function getOrCreateAgent(wallet) {
   const agentFairScore = calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications);
   const recommendation = getRecommendationTier(agentFairScore, verifications, wallet);
 
+  // Restore 8004 metadata if available
+  const erc8004Data = REGISTRY.erc8004ByWallet.get(wallet);
+  const erc8004Tag = erc8004Data ? { assetId: erc8004Data.assetId, name: erc8004Data.name, services: erc8004Data.services || [], skills: erc8004Data.skills || [] } : null;
+
   const agent = {
     wallet,
-    name: regData?.name || saidData?.identity?.name || null,
-    description: regData?.description || saidData?.identity?.description || null,
+    name: regData?.name || erc8004Data?.name || saidData?.identity?.name || null,
+    description: regData?.description || erc8004Data?.description || saidData?.identity?.description || null,
     website: regData?.website || saidData?.identity?.website || null,
     mcp: regData?.mcp || saidData?.endpoints?.mcp || null,
     scores: {
@@ -681,8 +687,9 @@ async function getOrCreateAgent(wallet) {
     verifications: {
       clawkey: verifications.clawkey ? { verified: verifications.clawkey.verified, humanId: verifications.clawkey.humanId } : null,
       said_onchain: REGISTRY.saidAgents.has(wallet),
-      erc8004: REGISTRY.erc8004Agents.has(wallet),
+      erc8004: REGISTRY.erc8004ByWallet.has(wallet),
     },
+    erc8004: erc8004Tag,
     descriptions: {
       reliability: getFeatureDescription('reliability', features.reliability),
       track_record: getFeatureDescription('track_record', features.track_record),
@@ -707,7 +714,7 @@ async function getOrCreateAgent(wallet) {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '12.6.0',
+    version: '12.7.0',
     description: 'The Trust & Discovery Layer for Solana AI Agents',
     api: { v1: { 'GET /v1/score?wallet=': 'Score any Solana wallet', 'POST /v1/score/batch': 'Score up to 25 wallets', 'GET /v1/health': 'Health check' } },
     endpoints: {
@@ -835,13 +842,13 @@ app.get('/directory', (req, res) => {
   const recommendation = req.query.recommendation; // highly_recommended, recommended, acceptable, caution, unverified
 
   let agents = Array.from(REGISTRY.agents.values())
-    .filter(a => a.isRegistered || a.erc8004 || REGISTRY.saidAgents.has(a.wallet));
+    .filter(a => a.isRegistered || a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet) || REGISTRY.saidAgents.has(a.wallet));
 
   // Source filter
-  if (source === '8004') agents = agents.filter(a => !!a.erc8004);
+  if (source === '8004') agents = agents.filter(a => !!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet));
   else if (source === 'said') agents = agents.filter(a => REGISTRY.saidAgents.has(a.wallet));
   else if (source === 'fairscale') agents = agents.filter(a => a.isRegistered);
-  else if (source === 'both') agents = agents.filter(a => !!a.erc8004 && REGISTRY.saidAgents.has(a.wallet));
+  else if (source === 'both') agents = agents.filter(a => (!!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet)) && REGISTRY.saidAgents.has(a.wallet));
 
   // Search filter (wallet, name)
   if (search) {
@@ -879,7 +886,7 @@ app.get('/directory', (req, res) => {
 
   const result = paged.map((a, i) => {
     const onSaid = REGISTRY.saidAgents.has(a.wallet);
-    const on8004 = !!a.erc8004;
+    const on8004 = !!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet);
     const sources = [];
     if (onSaid) sources.push('said');
     if (on8004) sources.push('erc8004');
@@ -1024,8 +1031,7 @@ app.get('/stats', (req, res) => {
   // Count overlaps
   let onBoth = 0;
   for (const [wallet] of REGISTRY.saidAgents) {
-    const agent = REGISTRY.agents.get(wallet);
-    if (agent?.erc8004) onBoth++;
+    if (REGISTRY.erc8004ByWallet.has(wallet)) onBoth++;
   }
   res.json({
     agents: REGISTRY.agents.size, registered: REGISTRY.registeredAgents.size,
@@ -1042,7 +1048,7 @@ app.get('/stats', (req, res) => {
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Registry v12.6 on port ${CONFIG.PORT}`);
+  console.log(`FairScale Registry v12.7 on port ${CONFIG.PORT}`);
   console.log(`  Integrations: FairScale API, SAID Protocol (on-chain PDA), ERC-8004, ClawKey (VeryAI)`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
