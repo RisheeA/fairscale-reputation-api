@@ -422,127 +422,266 @@ function scale(value, max, curve = 1.5) {
 function clamp(v, min = 0, max = 100) { return Math.min(Math.max(Math.round(v), min), max); }
 
 // =============================================================================
-// TRUST-FOCUSED SCORING ENGINE
+// TRUST SCORING ENGINE v3
 // =============================================================================
-// Four pillars of agent trust, weighted by importance to "can I trust this agent?":
-//   Reliability (35%) — behavioral consistency, no exploitative patterns
-//   Track Record (25%) — age × sustained activity, not just volume  
-//   Economic Stake (20%) — skin in the game via real asset holdings
-//   Ecosystem Legitimacy (20%) — cross-protocol diversity, real usage patterns
+// Six pillars — on-chain behavior PLUS verification & social:
+//
+//   Reliability (25%)      — behavioral consistency, no exploitative patterns
+//   Track Record (15%)     — age × sustained activity, recency
+//   Economic Stake (10%)   — skin in the game via real asset holdings
+//   Ecosystem (10%)        — cross-protocol diversity
+//   Verification (25%)     — SAID, ERC-8004, ClawKey, payment verification
+//   Social & Reputation (15%) — FairScale social_score, badges, SAID attestations
+//
+// Plus: Red flag penalties (up to -15), Time decay multiplier (0.75 - 1.0)
+// Plus: Percentile rankings computed across full registry population
 
 function calculateAgentFeatures(fairscaleData) {
   const f = fairscaleData?.features || {};
 
-  // --- RELIABILITY (35% of trust) ---
-  // Core question: Does this agent behave predictably and non-exploitatively?
-  
-  // Conviction: ratio of held vs sold tokens (0-1, higher = more conviction)
+  // --- RELIABILITY (25%) ---
   const conviction = clamp((f.conviction_ratio || 0) * 100, 10, 100);
-  
-  // No dumps: binary flag, critical trust signal
   const noDumps = (f.no_instant_dumps === true || f.no_instant_dumps === 1 || f.no_instant_dumps >= 0.9) ? 100 : 20;
-  
-  // Tempo consistency: coefficient of variation in tx timing (lower = more consistent)
-  // CV of 0 = perfectly regular, CV of 2+ = highly erratic
   const tempoCV = f.tempo_cv || 0;
   const tempoConsistency = clamp(100 - (tempoCV * 40), 10, 100);
-  
-  // Burst ratio: ratio of burst vs steady activity (lower = better)
   const burstRatio = f.burst_ratio || 0;
   const steadiness = clamp(100 - (burstRatio * 80), 10, 100);
-  
-  // Net flow: positive = accumulating, negative = draining. Draining is a red flag.
   const netFlow = f.net_sol_flow_30d || 0;
   const flowScore = netFlow >= 0 ? clamp(60 + (netFlow * 2), 60, 100) : clamp(60 + (netFlow * 5), 10, 60);
-  
+
   const reliability = clamp(
-    (noDumps * 0.30) +        // No instant dumps — heaviest single signal
-    (conviction * 0.25) +      // Holds tokens, doesn't flip
-    (tempoConsistency * 0.20) + // Regular transaction cadence
-    (steadiness * 0.15) +      // Not bursty
-    (flowScore * 0.10),        // Not draining funds
+    (noDumps * 0.30) + (conviction * 0.25) + (tempoConsistency * 0.20) +
+    (steadiness * 0.15) + (flowScore * 0.10),
     10, 100
   );
 
-  // --- TRACK RECORD (25% of trust) ---
-  // Core question: Has this agent existed long enough with consistent activity?
-  
-  // Wallet age: days since first tx. 365 days = mature.
+  // --- TRACK RECORD (15%) ---
   const ageDays = f.wallet_age_days || 0;
   const ageScore = scale(ageDays, 365, 1.6);
-  
-  // Active days: how many days had transactions
   const activeDays = f.active_days || 0;
   const activeScore = scale(activeDays, 180, 1.5);
-  
-  // Activity ratio: active_days / age. Higher = consistently active, not dormant.
   const activityRatio = ageDays > 0 ? Math.min(activeDays / ageDays, 1) : 0;
   const consistencyScore = clamp(activityRatio * 100, 10, 100);
-  
-  // Median hold days: longer holds = more patient, less exploitative
   const holdDays = f.median_hold_days || 0;
   const holdScore = scale(holdDays, 60, 1.4);
-  
-  // Median gap hours: how often does it transact? Very low = bot-like spam, very high = dormant
-  // Sweet spot: 2-48 hours between txs
   const gapHours = f.median_gap_hours || 0;
   let gapScore;
-  if (gapHours <= 0.1) gapScore = 30;        // Suspiciously rapid — possible spam
-  else if (gapHours <= 1) gapScore = 50;      // Very active but possibly automated
-  else if (gapHours <= 48) gapScore = 90;     // Healthy regular activity
-  else if (gapHours <= 168) gapScore = 60;    // Weekly activity
-  else gapScore = 30;                          // Rarely active
-  
+  if (gapHours <= 0.1) gapScore = 30;
+  else if (gapHours <= 1) gapScore = 50;
+  else if (gapHours <= 48) gapScore = 90;
+  else if (gapHours <= 168) gapScore = 60;
+  else gapScore = 30;
+
   const track_record = clamp(
-    (ageScore * 0.30) +           // How old is the wallet
-    (activeScore * 0.25) +        // How many active days
-    (consistencyScore * 0.20) +   // Active days relative to age
-    (holdScore * 0.15) +          // Patience with holdings
-    (gapScore * 0.10),            // Transaction frequency sweet spot
+    (ageScore * 0.30) + (activeScore * 0.25) + (consistencyScore * 0.20) +
+    (holdScore * 0.15) + (gapScore * 0.10),
     10, 100
   );
 
-  // --- ECONOMIC STAKE (20% of trust) ---
-  // Core question: Does this agent have real value at risk?
-  
-  // Stablecoins: most trustworthy signal of economic commitment
+  // --- ECONOMIC STAKE (10%) ---
   const stableScore = clamp(f.stable_percentile_score || 10, 10, 100);
-  
-  // Native SOL: essential for operating on Solana
   const solScore = clamp(f.native_sol_percentile || 10, 10, 100);
-  
-  // LST: liquid staking tokens = long-term Solana commitment
   const lstScore = clamp(f.lst_percentile_score || 10, 10, 100);
-  
-  // Major tokens: blue-chip holdings
   const majorScore = clamp(f.major_percentile_score || 10, 10, 100);
-  
+
   const economic_stake = clamp(
-    (stableScore * 0.35) +   // Stables = real money commitment
-    (solScore * 0.25) +      // SOL = operational stake
-    (lstScore * 0.25) +      // LST = long-term ecosystem commitment
-    (majorScore * 0.15),     // Major tokens = additional signal
+    (stableScore * 0.35) + (solScore * 0.25) + (lstScore * 0.25) + (majorScore * 0.15),
     10, 100
   );
 
-  // --- ECOSYSTEM LEGITIMACY (20% of trust) ---
-  // Core question: Does this agent interact with real, diverse protocols?
-  
-  // Platform diversity: number of distinct protocols (max useful ~8-10)
+  // --- ECOSYSTEM LEGITIMACY (10%) ---
   const diversity = scale(f.platform_diversity || 0, 8, 1.4);
-  
-  // Tx count: raw volume. High is good but with diminishing returns.
   const txVolume = scale(f.tx_count || 0, 200, 1.8);
-  
-  // Combine diversity with volume — diversity matters more
-  // A wallet with 5 protocols and 50 txs is more legit than 1 protocol and 500 txs
+
   const ecosystem = clamp(
-    (diversity * 0.60) +    // Cross-protocol usage — strongest sybil resistance signal
-    (txVolume * 0.40),      // Transaction volume as supporting evidence
+    (diversity * 0.60) + (txVolume * 0.40),
     10, 100
   );
 
   return { reliability, track_record, economic_stake, ecosystem };
+}
+
+// --- VERIFICATION SCORE (25% of composite) ---
+// This is the big one: protocol registrations and human verification
+// are first-class trust signals, not just bonuses
+function calculateVerificationScore(wallet, saidData, verifications) {
+  let score = 0;
+  let maxPossible = 0;
+
+  // SAID Protocol on-chain PDA (registered as agent)
+  maxPossible += 20;
+  if (REGISTRY.saidAgents.has(wallet)) score += 20;
+
+  // ERC-8004 Solana Agent Registry (registered, paid gas)
+  maxPossible += 25;
+  if (REGISTRY.erc8004ByWallet.has(wallet)) score += 25;
+
+  // ClawKey human verification (strongest signal)
+  maxPossible += 30;
+  if (verifications?.clawkey?.verified) score += 30;
+
+  // FairScale self-registration
+  maxPossible += 5;
+  if (REGISTRY.registeredAgents.has(wallet)) score += 5;
+
+  // Payment verification ($5 USDC)
+  maxPossible += 10;
+  if (REGISTRY.verifiedWallets.has(wallet)) score += 10;
+
+  // SAID reputation tier
+  maxPossible += 10;
+  if (saidData?.reputation?.trustTier === 'high') score += 10;
+  else if (saidData?.reputation?.trustTier === 'medium') score += 5;
+
+  // Dual-registry bonus (on both SAID + 8004 = extra trust)
+  if (REGISTRY.saidAgents.has(wallet) && REGISTRY.erc8004ByWallet.has(wallet)) score += 10;
+
+  // Normalize to 0-100
+  return clamp((score / maxPossible) * 100, 0, 100);
+}
+
+// --- SOCIAL & REPUTATION SCORE (15% of composite) ---
+// Uses FairScale's social_score, badges, and SAID attestations
+function calculateSocialScore(fairscaleData, saidData) {
+  const socialRaw = fairscaleData?.social_score || 0;  // 0-100 from FairScale API
+  const badges = fairscaleData?.badges || [];
+  const attestations = saidData?.reputation?.feedbackCount || 0;
+  const saidRepScore = saidData?.reputation?.score || 0;
+
+  // FairScale social score (community reviews, off-chain signals)
+  const fsocialScore = clamp(socialRaw, 0, 100);
+
+  // Badge count — each badge earned is a social proof signal
+  const badgeScore = clamp(badges.length * 12, 0, 100);
+
+  // SAID attestation count — direct peer vouching
+  const attestScore = clamp(attestations * 8, 0, 100);
+
+  // SAID reputation score (if available)
+  const saidScore = clamp(saidRepScore, 0, 100);
+
+  // Weighted blend: FairScale social dominates, attestations second
+  if (saidRepScore > 0) {
+    return clamp(
+      (fsocialScore * 0.35) + (saidScore * 0.25) + (attestScore * 0.25) + (badgeScore * 0.15),
+      0, 100
+    );
+  }
+  return clamp(
+    (fsocialScore * 0.55) + (attestScore * 0.25) + (badgeScore * 0.20),
+    0, 100
+  );
+}
+
+// --- RED FLAG DETECTION ---
+// Returns a penalty from 0 (no flags) to -15 (severe)
+function detectRedFlags(fairscaleData) {
+  const f = fairscaleData?.features || {};
+  let penalty = 0;
+  const flags = [];
+
+  // New wallet with high volume = potential sybil/airdrop farmer
+  const ageDays = f.wallet_age_days || 0;
+  const txCount = f.tx_count || 0;
+  if (ageDays < 14 && txCount > 50) {
+    penalty -= 5;
+    flags.push('new_wallet_high_volume');
+  }
+
+  // Single protocol usage with high tx = bot
+  const diversity = f.platform_diversity || 0;
+  if (diversity <= 1 && txCount > 30) {
+    penalty -= 4;
+    flags.push('single_protocol_bot');
+  }
+
+  // Extremely rapid transactions = spam bot
+  const gapHours = f.median_gap_hours || 0;
+  if (gapHours > 0 && gapHours < 0.05) {
+    penalty -= 4;
+    flags.push('spam_bot_speed');
+  }
+
+  // Instant dumps = exploitative
+  if (f.no_instant_dumps === false || f.no_instant_dumps === 0) {
+    penalty -= 3;
+    flags.push('instant_dumps');
+  }
+
+  // Heavy SOL drain in last 30d = possible rug/exit
+  const netFlow = f.net_sol_flow_30d || 0;
+  if (netFlow < -10) {
+    penalty -= 3;
+    flags.push('heavy_sol_drain');
+  }
+
+  // Very high burst ratio = erratic, potentially manipulative
+  const burstRatio = f.burst_ratio || 0;
+  if (burstRatio > 0.7) {
+    penalty -= 2;
+    flags.push('high_burst_ratio');
+  }
+
+  return { penalty: Math.max(penalty, -15), flags };
+}
+
+// --- TIME DECAY ---
+// Multiplier from 0.75 (stale) to 1.0 (fresh). Based on FairScale API timestamp
+// and on-chain activity recency signals.
+function calculateTimeDecay(fairscaleData) {
+  const timestamp = fairscaleData?.timestamp;
+  const gapHours = fairscaleData?.features?.median_gap_hours || 0;
+  const activeDays = fairscaleData?.features?.active_days || 0;
+  const ageDays = fairscaleData?.features?.wallet_age_days || 1;
+
+  // How fresh is the FairScale scoring data?
+  let dataFreshness = 1.0;
+  if (timestamp) {
+    const hoursOld = (Date.now() - new Date(timestamp).getTime()) / (1000 * 60 * 60);
+    if (hoursOld > 168) dataFreshness = 0.90;      // > 1 week old
+    if (hoursOld > 720) dataFreshness = 0.85;       // > 30 days old
+    if (hoursOld > 2160) dataFreshness = 0.80;      // > 90 days old
+  }
+
+  // How recently active is the wallet? (activity ratio as proxy)
+  const activityRatio = ageDays > 0 ? activeDays / ageDays : 0;
+  let activityDecay = 1.0;
+  if (activityRatio < 0.01) activityDecay = 0.80;      // Almost never active
+  else if (activityRatio < 0.05) activityDecay = 0.90;  // Rarely active
+  else if (activityRatio < 0.10) activityDecay = 0.95;  // Occasionally active
+
+  // Combined: take the lower (more conservative) decay
+  return Math.max(Math.min(dataFreshness, activityDecay), 0.75);
+}
+
+// --- PERCENTILE RANKING ---
+// Computes percentile rank across all scored agents in registry
+function computePercentiles(wallet, features, agentFairScore) {
+  const allAgents = Array.from(REGISTRY.agents.values());
+  if (allAgents.length < 10) return null; // Not enough data
+
+  const metrics = {
+    agent_fairscore: agentFairScore,
+    reliability: features.reliability,
+    track_record: features.track_record,
+    economic_stake: features.economic_stake,
+    ecosystem: features.ecosystem,
+  };
+
+  const percentiles = {};
+  for (const [key, value] of Object.entries(metrics)) {
+    let belowCount = 0;
+    let total = 0;
+    for (const a of allAgents) {
+      const cmp = key === 'agent_fairscore' ? a.scores?.agent_fairscore : a.features?.[key];
+      if (cmp != null) {
+        total++;
+        if (cmp < value) belowCount++;
+      }
+    }
+    percentiles[key] = total > 0 ? Math.round((belowCount / total) * 100) : null;
+  }
+  return percentiles;
 }
 
 function getFeatureDescription(feature, value) {
@@ -567,8 +706,18 @@ function getFeatureDescription(feature, value) {
       mid: 'Moderate cross-protocol activity',
       low: 'Limited to few protocols or low transaction volume'
     },
+    verification: {
+      high: 'Multi-protocol verified (SAID + 8004 + ClawKey)',
+      mid: 'Registered on at least one agent protocol',
+      low: 'No protocol registrations or verifications'
+    },
+    social: {
+      high: 'Strong social reputation and peer attestations',
+      mid: 'Some social signals and community presence',
+      low: 'Limited social or community reputation'
+    },
   };
-  const tier = value >= 55 ? 'high' : value >= 30 ? 'mid' : 'low';
+  const tier = value >= 55 ? 'high' : value >= 25 ? 'mid' : 'low';
   return descs[feature]?.[tier] || '';
 }
 
@@ -577,44 +726,52 @@ function getFeatureDescription(feature, value) {
 // =============================================================================
 
 function calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications = {}) {
-  // The Agent FairScore blends FairScale's base score with our trust-focused feature analysis.
-  // FairScale's base already encodes wallet quality; our features add agent-specific trust interpretation.
-  
-  const fsBase = fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0;
-  const hasSaidReputation = saidData?.reputation?.score > 0;
-  
-  // Trust-weighted feature composite (NOT equal weights — reliability dominates)
+  // FairScale combined score (includes social) as base reference
+  const fsCombined = fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0;
+
+  // Six-pillar trust composite
+  const verificationScore = calculateVerificationScore(wallet, saidData, verifications);
+  const socialScore = calculateSocialScore(fairscaleData, saidData);
+
   const trustComposite = (
-    (features.reliability * 0.35) +
-    (features.track_record * 0.25) +
-    (features.economic_stake * 0.20) +
-    (features.ecosystem * 0.20)
+    (features.reliability * 0.25) +
+    (features.track_record * 0.15) +
+    (features.economic_stake * 0.10) +
+    (features.ecosystem * 0.10) +
+    (verificationScore * 0.25) +
+    (socialScore * 0.15)
   );
 
-  // Blend: FairScale base provides the foundation, trust composite refines it
-  // If SAID reputation exists, it gets a slice too
-  let blended;
-  if (hasSaidReputation) {
-    const saidScore = saidData.reputation.score || 0;
-    blended = (fsBase * 0.40) + (trustComposite * 0.45) + (saidScore * 0.15);
-  } else {
-    blended = (fsBase * 0.45) + (trustComposite * 0.55);
-  }
+  // Blend: FairScale combined (40%) + our trust composite (60%)
+  let blended = (fsCombined * 0.40) + (trustComposite * 0.60);
 
-  // Registry & verification bonuses
-  let bonuses = 0;
-  if (REGISTRY.saidAgents.has(wallet)) bonuses += 3;
-  if (REGISTRY.erc8004ByWallet.has(wallet)) bonuses += 5;
-  if (REGISTRY.saidAgents.has(wallet) && REGISTRY.erc8004ByWallet.has(wallet)) bonuses += 3;
-  if (saidData?.verified) bonuses += 3;
-  if (saidData?.reputation?.trustTier === 'high') bonuses += 4;
-  bonuses += Math.min((saidData?.reputation?.feedbackCount || 0) * 3, 12);
-  if (REGISTRY.registeredAgents.has(wallet)) bonuses += 2;
-  if (REGISTRY.verifiedWallets.has(wallet)) bonuses += 5;
-  if (verifications.clawkey?.verified) bonuses += 10;
+  // Red flag penalties
+  const { penalty, flags } = detectRedFlags(fairscaleData);
+  blended += penalty;
 
-  const total = blended + Math.min(bonuses, 30);
-  return Math.max(Math.min(Math.round(total), 100), 10);
+  // Time decay
+  const decay = calculateTimeDecay(fairscaleData);
+  blended *= decay;
+
+  const score = Math.max(Math.min(Math.round(blended), 100), 5);
+
+  // Store intermediate scores for transparency
+  return {
+    score,
+    breakdown: {
+      fs_combined: Math.round(fsCombined),
+      trust_composite: Math.round(trustComposite),
+      verification: Math.round(verificationScore),
+      social: Math.round(socialScore),
+      reliability: features.reliability,
+      track_record: features.track_record,
+      economic_stake: features.economic_stake,
+      ecosystem: features.ecosystem,
+      red_flag_penalty: penalty,
+      red_flags: flags,
+      time_decay: decay,
+    }
+  };
 }
 
 function getRecommendationTier(score, verifications, wallet) {
@@ -623,10 +780,17 @@ function getRecommendationTier(score, verifications, wallet) {
   const onSaid = REGISTRY.saidAgents.has(wallet);
   const registryCount = (on8004 ? 1 : 0) + (onSaid ? 1 : 0);
 
-  if (score >= 75 && isHumanVerified) return { tier: 'highly_recommended', label: 'Highly Recommended', color: 'gold' };
-  if (score >= 70 && registryCount >= 2) return { tier: 'highly_recommended', label: 'Highly Recommended', color: 'gold' };
-  if (score >= 60 && (on8004 || isHumanVerified)) return { tier: 'recommended', label: 'Recommended', color: 'green' };
+  // Highly Recommended: high score + strong verification
+  if (score >= 70 && isHumanVerified) return { tier: 'highly_recommended', label: 'Highly Recommended', color: 'gold' };
+  if (score >= 65 && registryCount >= 2) return { tier: 'highly_recommended', label: 'Highly Recommended', color: 'gold' };
+  if (score >= 75 && registryCount >= 1) return { tier: 'highly_recommended', label: 'Highly Recommended', color: 'gold' };
+
+  // Recommended: decent score + some verification
+  if (score >= 55 && (on8004 || isHumanVerified)) return { tier: 'recommended', label: 'Recommended', color: 'green' };
   if (score >= 50 && registryCount >= 1) return { tier: 'recommended', label: 'Recommended', color: 'green' };
+  if (score >= 60) return { tier: 'recommended', label: 'Recommended', color: 'green' };
+
+  // Acceptable: moderate score
   if (score >= 40) return { tier: 'acceptable', label: 'Acceptable', color: 'yellow' };
   if (score >= 25) return { tier: 'caution', label: 'Use with Caution', color: 'orange' };
   return { tier: 'unverified', label: 'Unverified', color: 'red' };
@@ -662,8 +826,11 @@ async function getOrCreateAgent(wallet) {
   } catch (e) { console.error('[Verifications]', e.message); }
 
   const features = calculateAgentFeatures(fairscaleData);
-  const agentFairScore = calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications);
+  const scoreResult = calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications);
+  const agentFairScore = scoreResult.score;
+  const breakdown = scoreResult.breakdown;
   const recommendation = getRecommendationTier(agentFairScore, verifications, wallet);
+  const percentiles = computePercentiles(wallet, features, agentFairScore);
 
   // Restore 8004 metadata if available
   const erc8004Data = REGISTRY.erc8004ByWallet.get(wallet);
@@ -678,23 +845,34 @@ async function getOrCreateAgent(wallet) {
     scores: {
       agent_fairscore: agentFairScore,
       fairscore_base: Math.round(fairscaleData?.fairscore_base || fairscaleData?.fairscore || 0),
+      social_score: Math.round(fairscaleData?.social_score || 0),
       said_score: saidData?.reputation?.score || null,
       said_trust_tier: saidData?.reputation?.trustTier || null,
       attestations: saidData?.reputation?.feedbackCount || 0,
     },
+    breakdown,
+    percentiles,
     recommendation,
-    features,
+    features: {
+      ...features,
+      verification: breakdown.verification,
+      social: breakdown.social,
+    },
     verifications: {
       clawkey: verifications.clawkey ? { verified: verifications.clawkey.verified, humanId: verifications.clawkey.humanId } : null,
       said_onchain: REGISTRY.saidAgents.has(wallet),
       erc8004: REGISTRY.erc8004ByWallet.has(wallet),
     },
     erc8004: erc8004Tag,
+    badges: fairscaleData?.badges || [],
+    red_flags: breakdown.red_flags,
     descriptions: {
       reliability: getFeatureDescription('reliability', features.reliability),
       track_record: getFeatureDescription('track_record', features.track_record),
       economic_stake: getFeatureDescription('economic_stake', features.economic_stake),
       ecosystem: getFeatureDescription('ecosystem', features.ecosystem),
+      verification: getFeatureDescription('verification', breakdown.verification),
+      social: getFeatureDescription('social', breakdown.social),
     },
     isRegistered: REGISTRY.registeredAgents.has(wallet),
     isSaidAgent: REGISTRY.saidAgents.has(wallet),
@@ -714,15 +892,15 @@ async function getOrCreateAgent(wallet) {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '12.7.0',
+    version: '13.0.0',
     description: 'The Trust & Discovery Layer for Solana AI Agents',
     api: { v1: { 'GET /v1/score?wallet=': 'Score any Solana wallet', 'POST /v1/score/batch': 'Score up to 25 wallets', 'GET /v1/health': 'Health check' } },
     endpoints: {
       'GET /score': 'Get agent score (legacy)', 'POST /register': 'Register agent (optional clawkeyDeviceId)',
       'POST /verify': 'Verify payment', 'POST /service': 'Register x402 service',
       'GET /services': 'List services',
-      'GET /directory': 'Agent directory (?page=1&limit=25&source=8004|said|fairscale|both&sort=agent_fairscore|reliability|track_record|economic_stake|ecosystem&search=...&tier=gold|silver|bronze&recommendation=highly_recommended|recommended|acceptable)',
-      'GET /leaderboard': 'Sub-score leaderboards (?metric=agent_fairscore|reliability|track_record|economic_stake|ecosystem&limit=25)',
+      'GET /directory': 'Agent directory (?page=1&limit=25&source=8004|said|fairscale|both&sort=agent_fairscore|reliability|track_record|economic_stake|ecosystem|verification|social&search=...&recommendation=highly_recommended|recommended|acceptable)',
+      'GET /leaderboard': 'Sub-score leaderboards (?metric=agent_fairscore|reliability|track_record|economic_stake|ecosystem|verification|social&limit=25)',
       'GET /stats': 'Registry stats', 'GET /8004/agents': 'List 8004 agents',
     },
     integrations: { erc8004: 'Solana Agent Registry', said: 'SAID Protocol (on-chain PDA)', clawkey: 'ClawKey / VeryAI', fairscale: 'FairScale Scoring Engine' },
@@ -744,7 +922,11 @@ app.get('/v1/score', async (req, res) => {
       wallet, fairscore: score, tier: score >= 70 ? 'gold' : score >= 40 ? 'silver' : 'bronze',
       recommendation: agent.recommendation,
       features: agent.features,
-      signals: { fairscore_base: agent.scores.fairscore_base, said_score: agent.scores.said_score, said_trust_tier: agent.scores.said_trust_tier, attestations: agent.scores.attestations, is_registered: agent.isRegistered, is_verified: agent.isVerified, is_said_agent: agent.isSaidAgent, is_erc8004: !!erc8004, human_verified: agent.verifications?.clawkey?.verified || false },
+      breakdown: agent.breakdown,
+      percentiles: agent.percentiles,
+      red_flags: agent.red_flags,
+      badges: agent.badges,
+      signals: { fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, said_score: agent.scores.said_score, said_trust_tier: agent.scores.said_trust_tier, attestations: agent.scores.attestations, is_registered: agent.isRegistered, is_verified: agent.isVerified, is_said_agent: agent.isSaidAgent, is_erc8004: !!erc8004, human_verified: agent.verifications?.clawkey?.verified || false },
       erc8004: erc8004 ? { asset_id: erc8004.assetId, name: erc8004.name, services: erc8004.services } : null,
       meta: { provider: 'FairScale', version: 'v1', scored_at: agent.lastUpdated, cache_ttl: 1800 },
     });
@@ -779,7 +961,7 @@ app.get('/score', async (req, res) => {
   if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
   const agent = await getOrCreateAgent(wallet);
   if (!agent) return res.status(404).json({ error: 'Could not fetch data', wallet });
-  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, recommendation: agent.recommendation, features: agent.features, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services });
+  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services });
 });
 
 // --- Registration ---
@@ -836,7 +1018,7 @@ app.get('/directory', (req, res) => {
   const page = Math.max(parseInt(req.query.page) || 1, 1);
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 25, 5), 100);
   const search = (req.query.search || '').toLowerCase().trim();
-  const sortBy = req.query.sort || 'agent_fairscore'; // agent_fairscore, reliability, track_record, economic_stake, ecosystem, fairscore_base
+  const sortBy = req.query.sort || 'agent_fairscore'; // agent_fairscore, reliability, track_record, economic_stake, ecosystem, verification, social
   const minScore = parseInt(req.query.min_score) || 0;
   const tier = req.query.tier; // gold, silver, bronze
   const recommendation = req.query.recommendation; // highly_recommended, recommended, acceptable, caution, unverified
@@ -875,6 +1057,8 @@ app.get('/directory', (req, res) => {
     track_record: (a, b) => (b.features?.track_record || 0) - (a.features?.track_record || 0),
     economic_stake: (a, b) => (b.features?.economic_stake || 0) - (a.features?.economic_stake || 0),
     ecosystem: (a, b) => (b.features?.ecosystem || 0) - (a.features?.ecosystem || 0),
+    verification: (a, b) => (b.features?.verification || 0) - (a.features?.verification || 0),
+    social: (a, b) => (b.features?.social || 0) - (a.features?.social || 0),
     fairscore_base: (a, b) => (b.scores?.fairscore_base || 0) - (a.scores?.fairscore_base || 0),
   }[sortBy] || sortFn.agent_fairscore;
   agents.sort(sortFn);
@@ -931,7 +1115,7 @@ app.get('/directory', (req, res) => {
 // --- Leaderboards ---
 
 app.get('/leaderboard', (req, res) => {
-  const metric = req.query.metric || 'agent_fairscore'; // agent_fairscore, reliability, track_record, economic_stake, ecosystem, fairscore_base
+  const metric = req.query.metric || 'agent_fairscore'; // agent_fairscore, reliability, track_record, economic_stake, ecosystem, verification, social
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 25, 5), 100);
 
   const allAgents = Array.from(REGISTRY.agents.values())
@@ -943,6 +1127,8 @@ app.get('/leaderboard', (req, res) => {
     track_record: a => a.features?.track_record || 0,
     economic_stake: a => a.features?.economic_stake || 0,
     ecosystem: a => a.features?.ecosystem || 0,
+    verification: a => a.features?.verification || 0,
+    social: a => a.features?.social || 0,
     fairscore_base: a => a.scores?.fairscore_base || 0,
   }[metric] || (a => a.scores.agent_fairscore);
 
@@ -1048,7 +1234,7 @@ app.get('/stats', (req, res) => {
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Registry v12.7 on port ${CONFIG.PORT}`);
+  console.log(`FairScale Registry v13.0 on port ${CONFIG.PORT}`);
   console.log(`  Integrations: FairScale API, SAID Protocol (on-chain PDA), ERC-8004, ClawKey (VeryAI)`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
