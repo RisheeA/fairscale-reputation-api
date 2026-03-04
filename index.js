@@ -460,23 +460,49 @@ function getFeatureDescription(feature, value) {
 }
 
 function calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications = {}) {
-  const fsComponent = (fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0) * 0.40;
-  const featureAvg = (features.activity + features.holdings + features.reliability + features.history) / 4;
-  const featureComponent = featureAvg * 0.30;
-  const saidComponent = (saidData?.reputation?.score || 0) * 0.20;
+  // Core score: weighted blend of FairScale base + feature analysis
+  // If SAID reputation exists, it contributes; if not, weight redistributes to base + features
+  const hasSaidReputation = saidData?.reputation?.score > 0;
+  const fsWeight = hasSaidReputation ? 0.45 : 0.55;
+  const featureWeight = hasSaidReputation ? 0.30 : 0.35;
+  const saidWeight = hasSaidReputation ? 0.15 : 0;
 
+  const fsComponent = (fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0) * fsWeight;
+  const featureAvg = (features.activity + features.holdings + features.reliability + features.history) / 4;
+  const featureComponent = featureAvg * featureWeight;
+  const saidComponent = (saidData?.reputation?.score || 0) * saidWeight;
+
+  // Registry & verification bonuses (higher caps for verified agents)
   let bonuses = 0;
-  if (saidData?.verified) bonuses += 2;
-  if (saidData?.reputation?.trustTier === 'high') bonuses += 3;
-  bonuses += Math.min((saidData?.reputation?.feedbackCount || 0) * 5, 15);
+  if (REGISTRY.saidAgents.has(wallet)) bonuses += 3;
+  if (REGISTRY.erc8004Agents.has(wallet)) bonuses += 5;
+  if (REGISTRY.saidAgents.has(wallet) && REGISTRY.erc8004Agents.has(wallet)) bonuses += 3; // dual-registry bonus
+  if (saidData?.verified) bonuses += 3;
+  if (saidData?.reputation?.trustTier === 'high') bonuses += 4;
+  bonuses += Math.min((saidData?.reputation?.feedbackCount || 0) * 3, 12);
   if (REGISTRY.registeredAgents.has(wallet)) bonuses += 2;
   if (REGISTRY.verifiedWallets.has(wallet)) bonuses += 5;
-  if (verifications.clawkey?.verified) bonuses += 8;
-  if (REGISTRY.saidAgents.has(wallet)) bonuses += 3;
-  if (REGISTRY.erc8004Agents.has(wallet)) bonuses += 3;
+  if (verifications.clawkey?.verified) bonuses += 10;
 
-  const total = fsComponent + featureComponent + saidComponent + Math.min(bonuses, 20);
-  return Math.max(Math.min(Math.round(total), 100), 10);
+  const total = fsComponent + featureComponent + saidComponent + Math.min(bonuses, 30);
+  const score = Math.max(Math.min(Math.round(total), 100), 10);
+
+  return score;
+}
+
+function getRecommendationTier(score, verifications, wallet) {
+  const isHumanVerified = verifications?.clawkey?.verified || false;
+  const on8004 = REGISTRY.erc8004Agents.has(wallet);
+  const onSaid = REGISTRY.saidAgents.has(wallet);
+  const registryCount = (on8004 ? 1 : 0) + (onSaid ? 1 : 0);
+
+  if (score >= 75 && isHumanVerified) return { tier: 'highly_recommended', label: 'Highly Recommended', color: 'gold' };
+  if (score >= 70 && registryCount >= 2) return { tier: 'highly_recommended', label: 'Highly Recommended', color: 'gold' };
+  if (score >= 60 && (on8004 || isHumanVerified)) return { tier: 'recommended', label: 'Recommended', color: 'green' };
+  if (score >= 50 && registryCount >= 1) return { tier: 'recommended', label: 'Recommended', color: 'green' };
+  if (score >= 40) return { tier: 'acceptable', label: 'Acceptable', color: 'yellow' };
+  if (score >= 25) return { tier: 'caution', label: 'Use with Caution', color: 'orange' };
+  return { tier: 'unverified', label: 'Unverified', color: 'red' };
 }
 
 // =============================================================================
@@ -486,7 +512,7 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
 async function getOrCreateAgent(wallet) {
   if (REGISTRY.agents.has(wallet)) {
     const cached = REGISTRY.agents.get(wallet);
-    if (Date.now() - new Date(cached.lastUpdated).getTime() < 300000) return cached;
+    if (Date.now() - new Date(cached.lastUpdated).getTime() < 1800000) return cached;
   }
 
   const [fairscaleData, saidData] = await Promise.all([
@@ -510,6 +536,7 @@ async function getOrCreateAgent(wallet) {
 
   const features = calculateAgentFeatures(fairscaleData);
   const agentFairScore = calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications);
+  const recommendation = getRecommendationTier(agentFairScore, verifications, wallet);
 
   const agent = {
     wallet,
@@ -524,6 +551,7 @@ async function getOrCreateAgent(wallet) {
       said_trust_tier: saidData?.reputation?.trustTier || null,
       attestations: saidData?.reputation?.feedbackCount || 0,
     },
+    recommendation,
     features,
     verifications: {
       clawkey: verifications.clawkey ? { verified: verifications.clawkey.verified, humanId: verifications.clawkey.humanId } : null,
@@ -554,13 +582,15 @@ async function getOrCreateAgent(wallet) {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '12.4.0',
+    version: '12.5.0',
     description: 'The Trust & Discovery Layer for Solana AI Agents',
     api: { v1: { 'GET /v1/score?wallet=': 'Score any Solana wallet', 'POST /v1/score/batch': 'Score up to 25 wallets', 'GET /v1/health': 'Health check' } },
     endpoints: {
       'GET /score': 'Get agent score (legacy)', 'POST /register': 'Register agent (optional clawkeyDeviceId)',
       'POST /verify': 'Verify payment', 'POST /service': 'Register x402 service',
-      'GET /services': 'List services', 'GET /directory': 'All agents (?source=8004|said|fairscale)',
+      'GET /services': 'List services',
+      'GET /directory': 'Agent directory (?page=1&limit=25&source=8004|said|fairscale|both&sort=agent_fairscore|activity|holdings|reliability|history&search=...&tier=gold|silver|bronze&recommendation=highly_recommended|recommended|acceptable)',
+      'GET /leaderboard': 'Sub-score leaderboards (?metric=agent_fairscore|activity|holdings|reliability|history&limit=25)',
       'GET /stats': 'Registry stats', 'GET /8004/agents': 'List 8004 agents',
     },
     integrations: { erc8004: 'Solana Agent Registry', said: 'SAID Protocol (on-chain PDA)', clawkey: 'ClawKey / VeryAI', fairscale: 'FairScale Scoring Engine' },
@@ -580,10 +610,11 @@ app.get('/v1/score', async (req, res) => {
     const erc8004 = agent.erc8004 || null;
     res.json({
       wallet, fairscore: score, tier: score >= 70 ? 'gold' : score >= 40 ? 'silver' : 'bronze',
+      recommendation: agent.recommendation,
       features: agent.features,
       signals: { fairscore_base: agent.scores.fairscore_base, said_score: agent.scores.said_score, said_trust_tier: agent.scores.said_trust_tier, attestations: agent.scores.attestations, is_registered: agent.isRegistered, is_verified: agent.isVerified, is_said_agent: agent.isSaidAgent, is_erc8004: !!erc8004, human_verified: agent.verifications?.clawkey?.verified || false },
       erc8004: erc8004 ? { asset_id: erc8004.assetId, name: erc8004.name, services: erc8004.services } : null,
-      meta: { provider: 'FairScale', version: 'v1', scored_at: agent.lastUpdated, cache_ttl: 300 },
+      meta: { provider: 'FairScale', version: 'v1', scored_at: agent.lastUpdated, cache_ttl: 1800 },
     });
   } catch (e) { console.error('v1/score error:', e.message); res.status(500).json({ error: 'internal_error' }); }
 });
@@ -616,7 +647,7 @@ app.get('/score', async (req, res) => {
   if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
   const agent = await getOrCreateAgent(wallet);
   if (!agent) return res.status(404).json({ error: 'Could not fetch data', wallet });
-  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, features: agent.features, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services });
+  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, recommendation: agent.recommendation, features: agent.features, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services });
 });
 
 // --- Registration ---
@@ -670,49 +701,137 @@ app.post('/verify', async (req, res) => {
 
 app.get('/directory', (req, res) => {
   const source = req.query.source;
-  const agents = Array.from(REGISTRY.agents.values())
-    .filter(a => a.isRegistered || a.erc8004 || REGISTRY.saidAgents.has(a.wallet))
-    .filter(a => {
-      if (source === '8004') return !!a.erc8004;
-      if (source === 'said') return REGISTRY.saidAgents.has(a.wallet);
-      if (source === 'fairscale') return a.isRegistered;
-      return true;
-    })
-    .sort((a, b) => b.scores.agent_fairscore - a.scores.agent_fairscore)
-    .slice(0, 1000)
-    .map(a => {
-      const onSaid = REGISTRY.saidAgents.has(a.wallet);
-      const on8004 = !!a.erc8004;
-      const sources = [];
-      if (onSaid) sources.push('said');
-      if (on8004) sources.push('erc8004');
-      if (a.isRegistered) sources.push('fairscale');
+  const page = Math.max(parseInt(req.query.page) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit) || 25, 5), 100);
+  const search = (req.query.search || '').toLowerCase().trim();
+  const sortBy = req.query.sort || 'agent_fairscore'; // agent_fairscore, activity, holdings, reliability, history, fairscore_base
+  const minScore = parseInt(req.query.min_score) || 0;
+  const tier = req.query.tier; // gold, silver, bronze
+  const recommendation = req.query.recommendation; // highly_recommended, recommended, acceptable, caution, unverified
 
-      // Score boost breakdown
-      const boosts = {};
-      if (onSaid) boosts.said_onchain = '+3';
-      if (on8004) boosts.erc8004_registry = '+3';
-      if (a.isRegistered) boosts.fairscale_registered = '+2';
-      if (a.isVerified) boosts.payment_verified = '+5';
-      if (a.verifications?.clawkey?.verified) boosts.clawkey_human = '+8';
-      if (a.scores?.said_score > 0) boosts.said_reputation = `+${Math.min((a.scores.attestations || 0) * 5, 15)} (feedback)`;
-      if (a.scores?.said_trust_tier === 'high') boosts.said_trust = '+3';
+  let agents = Array.from(REGISTRY.agents.values())
+    .filter(a => a.isRegistered || a.erc8004 || REGISTRY.saidAgents.has(a.wallet));
 
-      return {
-        wallet: a.wallet,
-        name: a.erc8004?.name || a.name || `Agent ${a.wallet.slice(0, 8)}...`,
-        agent_fairscore: a.scores.agent_fairscore,
-        fairscore_base: a.scores.fairscore_base,
-        isVerified: a.isVerified,
-        humanVerified: a.verifications?.clawkey?.verified || false,
-        services: a.services.length + (a.erc8004?.services?.length || 0),
-        sources,
-        boosts,
-        said: onSaid ? { pda: REGISTRY.saidAgents.get(a.wallet)?.pda || null, score: a.scores.said_score, trustTier: a.scores.said_trust_tier, feedbackCount: a.scores.attestations } : null,
-        erc8004: on8004 ? { assetId: a.erc8004.assetId, name: a.erc8004.name, skills: a.erc8004.skills || [], services: a.erc8004.services || [] } : null,
-      };
-    });
-  res.json({ total: agents.length, agents });
+  // Source filter
+  if (source === '8004') agents = agents.filter(a => !!a.erc8004);
+  else if (source === 'said') agents = agents.filter(a => REGISTRY.saidAgents.has(a.wallet));
+  else if (source === 'fairscale') agents = agents.filter(a => a.isRegistered);
+  else if (source === 'both') agents = agents.filter(a => !!a.erc8004 && REGISTRY.saidAgents.has(a.wallet));
+
+  // Search filter (wallet, name)
+  if (search) {
+    agents = agents.filter(a =>
+      a.wallet.toLowerCase().includes(search) ||
+      (a.name || '').toLowerCase().includes(search) ||
+      (a.erc8004?.name || '').toLowerCase().includes(search)
+    );
+  }
+
+  // Score filters
+  if (minScore > 0) agents = agents.filter(a => a.scores.agent_fairscore >= minScore);
+  if (tier === 'gold') agents = agents.filter(a => a.scores.agent_fairscore >= 70);
+  else if (tier === 'silver') agents = agents.filter(a => a.scores.agent_fairscore >= 40 && a.scores.agent_fairscore < 70);
+  else if (tier === 'bronze') agents = agents.filter(a => a.scores.agent_fairscore < 40);
+
+  // Recommendation filter
+  if (recommendation) agents = agents.filter(a => a.recommendation?.tier === recommendation);
+
+  // Sort
+  const sortFn = {
+    agent_fairscore: (a, b) => b.scores.agent_fairscore - a.scores.agent_fairscore,
+    activity: (a, b) => (b.features?.activity || 0) - (a.features?.activity || 0),
+    holdings: (a, b) => (b.features?.holdings || 0) - (a.features?.holdings || 0),
+    reliability: (a, b) => (b.features?.reliability || 0) - (a.features?.reliability || 0),
+    history: (a, b) => (b.features?.history || 0) - (a.features?.history || 0),
+    fairscore_base: (a, b) => (b.scores?.fairscore_base || 0) - (a.scores?.fairscore_base || 0),
+  }[sortBy] || sortFn.agent_fairscore;
+  agents.sort(sortFn);
+
+  const total = agents.length;
+  const totalPages = Math.ceil(total / limit);
+  const offset = (page - 1) * limit;
+  const paged = agents.slice(offset, offset + limit);
+
+  const result = paged.map((a, i) => {
+    const onSaid = REGISTRY.saidAgents.has(a.wallet);
+    const on8004 = !!a.erc8004;
+    const sources = [];
+    if (onSaid) sources.push('said');
+    if (on8004) sources.push('erc8004');
+    if (a.isRegistered) sources.push('fairscale');
+
+    const boosts = {};
+    if (onSaid) boosts.said_onchain = '+3';
+    if (on8004) boosts.erc8004_registry = '+5';
+    if (onSaid && on8004) boosts.dual_registry = '+3';
+    if (a.isRegistered) boosts.fairscale_registered = '+2';
+    if (a.isVerified) boosts.payment_verified = '+5';
+    if (a.verifications?.clawkey?.verified) boosts.clawkey_human = '+10';
+    if (a.scores?.said_score > 0) boosts.said_reputation = `+${Math.min((a.scores.attestations || 0) * 3, 12)}`;
+    if (a.scores?.said_trust_tier === 'high') boosts.said_trust = '+4';
+
+    return {
+      rank: offset + i + 1,
+      wallet: a.wallet,
+      name: a.erc8004?.name || a.name || `Agent ${a.wallet.slice(0, 8)}...`,
+      agent_fairscore: a.scores.agent_fairscore,
+      fairscore_base: a.scores.fairscore_base,
+      recommendation: a.recommendation,
+      features: a.features,
+      isVerified: a.isVerified,
+      humanVerified: a.verifications?.clawkey?.verified || false,
+      services: a.services.length + (a.erc8004?.services?.length || 0),
+      sources,
+      boosts,
+      said: onSaid ? { pda: REGISTRY.saidAgents.get(a.wallet)?.pda || null, score: a.scores.said_score, trustTier: a.scores.said_trust_tier, feedbackCount: a.scores.attestations } : null,
+      erc8004: on8004 ? { assetId: a.erc8004.assetId, name: a.erc8004.name, skills: a.erc8004.skills || [], services: a.erc8004.services || [] } : null,
+    };
+  });
+
+  res.json({
+    total, page, limit, totalPages,
+    sort: sortBy,
+    filters: { source: source || 'all', search: search || null, tier: tier || null, minScore: minScore || null, recommendation: recommendation || null },
+    agents: result,
+  });
+});
+
+// --- Leaderboards ---
+
+app.get('/leaderboard', (req, res) => {
+  const metric = req.query.metric || 'agent_fairscore'; // agent_fairscore, activity, holdings, reliability, history, fairscore_base
+  const limit = Math.min(Math.max(parseInt(req.query.limit) || 25, 5), 100);
+
+  const allAgents = Array.from(REGISTRY.agents.values())
+    .filter(a => a.isRegistered || a.erc8004 || REGISTRY.saidAgents.has(a.wallet));
+
+  const getValue = {
+    agent_fairscore: a => a.scores.agent_fairscore,
+    activity: a => a.features?.activity || 0,
+    holdings: a => a.features?.holdings || 0,
+    reliability: a => a.features?.reliability || 0,
+    history: a => a.features?.history || 0,
+    fairscore_base: a => a.scores?.fairscore_base || 0,
+  }[metric] || (a => a.scores.agent_fairscore);
+
+  const sorted = allAgents
+    .sort((a, b) => getValue(b) - getValue(a))
+    .slice(0, limit)
+    .map((a, i) => ({
+      rank: i + 1,
+      wallet: a.wallet,
+      name: a.erc8004?.name || a.name || `Agent ${a.wallet.slice(0, 8)}...`,
+      value: getValue(a),
+      agent_fairscore: a.scores.agent_fairscore,
+      recommendation: a.recommendation,
+      sources: [
+        ...(REGISTRY.saidAgents.has(a.wallet) ? ['said'] : []),
+        ...(a.erc8004 ? ['erc8004'] : []),
+        ...(a.isRegistered ? ['fairscale'] : []),
+      ],
+    }));
+
+  res.json({ metric, total: allAgents.length, showing: sorted.length, leaderboard: sorted });
 });
 
 // --- 8004 Routes ---
@@ -798,7 +917,7 @@ app.get('/stats', (req, res) => {
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Registry v12.4 on port ${CONFIG.PORT}`);
+  console.log(`FairScale Registry v12.5 on port ${CONFIG.PORT}`);
   console.log(`  Integrations: FairScale API, SAID Protocol (on-chain PDA), ERC-8004, ClawKey (VeryAI)`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
