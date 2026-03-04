@@ -262,10 +262,10 @@ async function resolve8004Metadata(uri) {
 async function syncFrom8004() {
   console.log('[8004 Sync] Starting...');
   try {
-    const rawAgents = await fetch8004Agents(500);
+    const rawAgents = await fetch8004Agents(2000);
     if (rawAgents.length === 0) { console.log('[8004 Sync] No agents found. Retry next cycle.'); return; }
     console.log(`[8004 Sync] Found ${rawAgents.length} agents, enriching...`);
-    let imported = 0, enriched = 0, failed = 0;
+    let imported = 0, enriched = 0, failed = 0, nullWallets = 0;
     for (const agent of rawAgents) {
       try {
         REGISTRY.erc8004Agents.set(agent.assetId, agent);
@@ -284,12 +284,13 @@ async function syncFrom8004() {
           if (!existing || Date.now() - new Date(existing.lastUpdated).getTime() > 600000) {
             const scored = await getOrCreateAgent(agent.wallet);
             if (scored) { scored.erc8004 = tag; imported++; }
+            else { failed++; }
           } else { existing.erc8004 = tag; imported++; }
-        }
-        await new Promise(resolve => setTimeout(resolve, 250));
-      } catch (e) { failed++; }
+        } else { nullWallets++; }
+        await new Promise(resolve => setTimeout(resolve, 150));
+      } catch (e) { failed++; console.error(`[8004 Sync] Error scoring agent:`, e.message); }
     }
-    console.log(`[8004 Sync] Done: ${imported} scored, ${enriched} metadata, ${failed} failed / ${rawAgents.length}`);
+    console.log(`[8004 Sync] Done: ${imported} scored, ${enriched} metadata, ${nullWallets} null wallets, ${failed} failed / ${rawAgents.length}`);
     REGISTRY.lastErc8004Sync = new Date().toISOString();
   } catch (e) { console.error('[8004 Sync] Error:', e.message); }
 }
@@ -297,9 +298,9 @@ async function syncFrom8004() {
 async function syncFromSAID() {
   console.log('[SAID Sync] Starting (on-chain PDA discovery via Helius)...');
   try {
-    const onChainAgents = await fetchSAIDAgentsOnChain(500);
+    const onChainAgents = await fetchSAIDAgentsOnChain(2000);
     console.log(`[SAID Sync] Found ${onChainAgents.length} on-chain agent PDAs`);
-    let imported = 0, failed = 0;
+    let imported = 0, failed = 0, skippedNull = 0;
 
     // Phase 1: Register all wallets in saidAgents map
     for (const agent of onChainAgents) {
@@ -313,12 +314,14 @@ async function syncFromSAID() {
       try {
         const result = await getOrCreateAgent(wallet);
         if (result) imported++;
-        else failed++;
-      } catch (e) { failed++; }
-      await new Promise(resolve => setTimeout(resolve, 200));
+        else { skippedNull++; failed++; }
+      } catch (e) { failed++; console.error(`[SAID Sync] Score failed for ${wallet.slice(0,8)}:`, e.message); }
+      await new Promise(resolve => setTimeout(resolve, 150));
     }
+    console.log(`[SAID Sync] Scoring: ${imported} imported, ${skippedNull} null responses, ${failed - skippedNull} errors`);
 
     console.log(`[SAID Sync] Complete: ${imported} imported, ${failed} failed, ${REGISTRY.saidAgents.size} total`);
+    console.log(`[Registry] Total agents in memory: ${REGISTRY.agents.size} | SAID: ${REGISTRY.saidAgents.size} | 8004: ${REGISTRY.erc8004Agents.size}`);
     REGISTRY.lastSaidSync = new Date().toISOString();
   } catch (e) { console.error('[SAID Sync] Error:', e.message); }
 }
@@ -445,7 +448,10 @@ async function getOrCreateAgent(wallet) {
     getSAIDData(wallet)
   ]);
 
-  if (!fairscaleData && !saidData) return null;
+  if (!fairscaleData && !saidData) {
+    console.warn(`[Score] No data for ${wallet.slice(0,8)}... (both APIs returned null)`);
+    return null;
+  }
 
   const regData = REGISTRY.registeredAgents.get(wallet);
 
@@ -502,7 +508,7 @@ async function getOrCreateAgent(wallet) {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '12.1.0',
+    version: '12.2.0',
     description: 'The Trust & Discovery Layer for Solana AI Agents',
     api: { v1: { 'GET /v1/score?wallet=': 'Score any Solana wallet', 'POST /v1/score/batch': 'Score up to 25 wallets', 'GET /v1/health': 'Health check' } },
     endpoints: {
@@ -627,7 +633,7 @@ app.get('/directory', (req, res) => {
       return true;
     })
     .sort((a, b) => b.scores.agent_fairscore - a.scores.agent_fairscore)
-    .slice(0, 200)
+    .slice(0, 1000)
     .map(a => ({
       wallet: a.wallet,
       name: a.erc8004?.name || a.name || `Agent ${a.wallet.slice(0, 8)}...`,
@@ -673,7 +679,7 @@ app.post('/admin/sync-8004', async (req, res) => {
 app.post('/admin/sync-said', async (req, res) => {
   if (req.body.apiKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: 'Invalid API key' });
   try {
-    const agents = await fetchSAIDAgentsOnChain(500);
+    const agents = await fetchSAIDAgentsOnChain(2000);
     if (agents.length === 0) return res.json({ source: 'SAID (on-chain)', total_found: 0, note: 'No PDAs found.' });
     const results = { success: [], failed: [] };
     for (const agent of agents) {
@@ -718,7 +724,7 @@ app.get('/stats', (req, res) => {
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Registry v12.1 on port ${CONFIG.PORT}`);
+  console.log(`FairScale Registry v12.2 on port ${CONFIG.PORT}`);
   console.log(`  Integrations: FairScale API, SAID Protocol (on-chain PDA), ERC-8004, ClawKey (VeryAI)`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
