@@ -580,17 +580,20 @@ function detectRedFlags(fairscaleData) {
   let penalty = 0;
   const flags = [];
 
-  // New wallet with high volume = potential sybil/airdrop farmer
+  // New wallet with very high volume = potential sybil/airdrop farmer
   const ageDays = f.wallet_age_days || 0;
   const txCount = f.tx_count || 0;
-  if (ageDays < 14 && txCount > 50) {
+  if (ageDays < 7 && txCount > 100) {
     penalty -= 5;
+    flags.push('new_wallet_high_volume');
+  } else if (ageDays < 14 && txCount > 200) {
+    penalty -= 3;
     flags.push('new_wallet_high_volume');
   }
 
-  // Single protocol usage with high tx = bot
+  // Single protocol usage with high tx = bot (only flag if extremely concentrated)
   const diversity = f.platform_diversity || 0;
-  if (diversity <= 1 && txCount > 30) {
+  if (diversity <= 1 && txCount > 100) {
     penalty -= 4;
     flags.push('single_protocol_bot');
   }
@@ -617,7 +620,7 @@ function detectRedFlags(fairscaleData) {
 
   // Very high burst ratio = erratic, potentially manipulative
   const burstRatio = f.burst_ratio || 0;
-  if (burstRatio > 0.7) {
+  if (burstRatio > 0.85) {
     penalty -= 2;
     flags.push('high_burst_ratio');
   }
@@ -729,21 +732,34 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
   // FairScale combined score (includes social) as base reference
   const fsCombined = fairscaleData?.fairscore || fairscaleData?.fairscore_base || 0;
 
-  // Six-pillar trust composite
+  // Six-pillar trust composite with DYNAMIC WEIGHT REDISTRIBUTION
+  // If social data is absent, redistribute that weight to verification + reliability
   const verificationScore = calculateVerificationScore(wallet, saidData, verifications);
   const socialScore = calculateSocialScore(fairscaleData, saidData);
+  
+  const hasSocialData = (fairscaleData?.social_score > 0) || (saidData?.reputation?.score > 0) || (fairscaleData?.badges?.length > 0);
+  
+  let weights;
+  if (hasSocialData) {
+    // Full six pillars
+    weights = { verification: 0.25, reliability: 0.25, social: 0.15, track_record: 0.15, economic_stake: 0.10, ecosystem: 0.10 };
+  } else {
+    // No social data — redistribute 15% to verification (+5%), reliability (+5%), track_record (+5%)
+    weights = { verification: 0.30, reliability: 0.30, social: 0, track_record: 0.20, economic_stake: 0.10, ecosystem: 0.10 };
+  }
 
   const trustComposite = (
-    (features.reliability * 0.25) +
-    (features.track_record * 0.15) +
-    (features.economic_stake * 0.10) +
-    (features.ecosystem * 0.10) +
-    (verificationScore * 0.25) +
-    (socialScore * 0.15)
+    (verificationScore * weights.verification) +
+    (features.reliability * weights.reliability) +
+    (socialScore * weights.social) +
+    (features.track_record * weights.track_record) +
+    (features.economic_stake * weights.economic_stake) +
+    (features.ecosystem * weights.ecosystem)
   );
 
-  // Blend: FairScale combined (40%) + our trust composite (60%)
-  let blended = (fsCombined * 0.40) + (trustComposite * 0.60);
+  // Blend: FairScale combined (35%) + our trust composite (65%)
+  // Slightly more weight to our composite since we add verification + social + red flags
+  let blended = (fsCombined * 0.35) + (trustComposite * 0.65);
 
   // Red flag penalties
   const { penalty, flags } = detectRedFlags(fairscaleData);
@@ -755,7 +771,6 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
 
   const score = Math.max(Math.min(Math.round(blended), 100), 5);
 
-  // Store intermediate scores for transparency
   return {
     score,
     breakdown: {
@@ -763,6 +778,8 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
       trust_composite: Math.round(trustComposite),
       verification: Math.round(verificationScore),
       social: Math.round(socialScore),
+      has_social_data: hasSocialData,
+      weights_used: weights,
       reliability: features.reliability,
       track_record: features.track_record,
       economic_stake: features.economic_stake,
@@ -892,7 +909,7 @@ async function getOrCreateAgent(wallet) {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '13.0.0',
+    version: '13.1.0',
     description: 'The Trust & Discovery Layer for Solana AI Agents',
     api: { v1: { 'GET /v1/score?wallet=': 'Score any Solana wallet', 'POST /v1/score/batch': 'Score up to 25 wallets', 'GET /v1/health': 'Health check' } },
     endpoints: {
@@ -1234,7 +1251,7 @@ app.get('/stats', (req, res) => {
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Registry v13.0 on port ${CONFIG.PORT}`);
+  console.log(`FairScale Registry v13.1 on port ${CONFIG.PORT}`);
   console.log(`  Integrations: FairScale API, SAID Protocol (on-chain PDA), ERC-8004, ClawKey (VeryAI)`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
