@@ -152,17 +152,21 @@ async function fetch8004Agents(limit = 500) {
   try {
     const r = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getProgramAccounts', params: [CONFIG.ERC8004_REGISTRY_PROGRAM, { encoding: 'base64', commitment: 'confirmed', filters: [{ dataSize: 97 }] }] })
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getProgramAccounts', params: [CONFIG.ERC8004_REGISTRY_PROGRAM, { encoding: 'base64', commitment: 'confirmed' }] })
     });
     const d = await r.json();
-    const configAccounts = d.result || [];
-    console.log(`[8004 Sync] Found ${configAccounts.length} config PDAs`);
+    const allAccounts = d.result || [];
+    console.log(`[8004 Sync] Found ${allAccounts.length} total program accounts`);
+    // Config PDA is the smallest account (< 100 bytes), agent PDAs are much larger
+    const configAccounts = allAccounts
+      .map(a => ({ pubkey: a.pubkey, buf: Buffer.from(a.account.data[0], 'base64') }))
+      .filter(a => a.buf.length < 100 && a.buf.length >= 40)
+      .sort((a, b) => a.buf.length - b.buf.length);
+    console.log(`[8004 Sync] Found ${configAccounts.length} config-sized PDAs (< 100 bytes)`);
     if (configAccounts.length > 0) {
-      const buf = Buffer.from(configAccounts[0].account.data[0], 'base64');
-      if (buf.length >= 40) {
-        collectionAddress = encodeBase58(buf.slice(8, 40));
-        console.log(`[8004 Sync] Collection address: ${collectionAddress}`);
-      }
+      const buf = configAccounts[0].buf;
+      collectionAddress = encodeBase58(buf.slice(8, 40));
+      console.log(`[8004 Sync] Collection address: ${collectionAddress} (from ${buf.length}-byte PDA)`);
     }
   } catch (e) { console.warn('[8004] Config lookup failed:', e.message); }
 
@@ -219,8 +223,8 @@ async function fetch8004Agents(limit = 500) {
       try {
         const buf = Buffer.from(account.account.data[0], 'base64');
         if (buf.length >= 72) {
-          const assetId = encodeBase58(buf.slice(8, 40));
-          const ownerWallet = encodeBase58(buf.slice(40, 72));
+          const ownerWallet = encodeBase58(buf.slice(8, 40));
+          const assetId = encodeBase58(buf.slice(40, 72));
           if (ownerWallet && ownerWallet.length >= 32 && ownerWallet.length <= 44) {
             agents.push({ assetId: assetId || account.pubkey, wallet: ownerWallet, name: null, description: null, image: null, jsonUri: null, services: [], skills: [], rawMetadata: null, source: 'erc8004', fetchedAt: new Date().toISOString() });
           }
@@ -498,7 +502,7 @@ async function getOrCreateAgent(wallet) {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '12.0.0',
+    version: '12.1.0',
     description: 'The Trust & Discovery Layer for Solana AI Agents',
     api: { v1: { 'GET /v1/score?wallet=': 'Score any Solana wallet', 'POST /v1/score/batch': 'Score up to 25 wallets', 'GET /v1/health': 'Health check' } },
     endpoints: {
@@ -714,7 +718,7 @@ app.get('/stats', (req, res) => {
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Registry v12.0 on port ${CONFIG.PORT}`);
+  console.log(`FairScale Registry v12.1 on port ${CONFIG.PORT}`);
   console.log(`  Integrations: FairScale API, SAID Protocol (on-chain PDA), ERC-8004, ClawKey (VeryAI)`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
