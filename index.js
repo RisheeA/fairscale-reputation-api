@@ -102,7 +102,7 @@ async function getClawKeyVerification(deviceIdOrPubkey) {
 // SAID PROTOCOL - ON-CHAIN REGISTRY SYNC
 // =============================================================================
 
-async function fetchSAIDAgentsOnChain(limit = 500) {
+async function fetchSAIDAgentsOnChain(limit = 2000) {
   if (!CONFIG.HELIUS_API_KEY) { console.warn('[SAID On-Chain] No HELIUS_API_KEY'); return []; }
   try {
     const response = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
@@ -114,28 +114,75 @@ async function fetchSAIDAgentsOnChain(limit = 500) {
     if (result.error) { console.error('[SAID On-Chain] RPC error:', result.error.message); return []; }
     const accounts = result.result || [];
     console.log(`[SAID On-Chain] Found ${accounts.length} program accounts`);
-    const agents = [];
+
+    // Step 1: Analyze account sizes to understand the data model
+    const sizeBuckets = {};
+    for (const account of accounts) {
+      const data = account.account?.data;
+      if (Array.isArray(data) && data[0]) {
+        const len = Buffer.from(data[0], 'base64').length;
+        sizeBuckets[len] = (sizeBuckets[len] || 0) + 1;
+      }
+    }
+    const sortedSizes = Object.entries(sizeBuckets).sort((a, b) => b[1] - a[1]);
+    console.log(`[SAID On-Chain] Account size distribution: ${sortedSizes.slice(0, 5).map(([s, c]) => `${s}b×${c}`).join(', ')}`);
+
+    // Step 2: Extract candidate wallets from ALL 32-byte aligned offsets after discriminator
+    // Group by most common account sizes (likely agent identity PDAs)
+    const candidateWallets = new Map(); // wallet -> { pda, offset, dataLength }
     for (const account of accounts) {
       try {
         const data = account.account?.data;
-        if (Array.isArray(data) && data[0]) {
-          const buffer = Buffer.from(data[0], 'base64');
-          const layouts = [{ offset: 8, label: 'anchor-default' }, { offset: 0, label: 'raw' }, { offset: 40, label: 'anchor-alt' }];
-          for (const layout of layouts) {
-            if (buffer.length >= layout.offset + 32) {
-              const ownerBytes = buffer.slice(layout.offset, layout.offset + 32);
-              if (ownerBytes.every(b => b === 0) || ownerBytes.every(b => b === 0xFF)) continue;
-              const ownerWallet = encodeBase58(ownerBytes);
-              if (ownerWallet && ownerWallet.length >= 32 && ownerWallet.length <= 44) {
-                agents.push({ pda: account.pubkey, wallet: ownerWallet, dataLength: buffer.length, layout: layout.label });
-                break;
-              }
+        if (!Array.isArray(data) || !data[0]) continue;
+        const buffer = Buffer.from(data[0], 'base64');
+        // For Anchor programs: 8-byte discriminator, then struct fields
+        // Try offset 8 (first Pubkey field after discriminator - most common for owner/authority)
+        if (buffer.length >= 40) {
+          const pubkeyBytes = buffer.slice(8, 40);
+          if (!pubkeyBytes.every(b => b === 0) && !pubkeyBytes.every(b => b === 0xFF)) {
+            const wallet = encodeBase58(pubkeyBytes);
+            if (wallet && wallet.length >= 32 && wallet.length <= 44) {
+              candidateWallets.set(wallet, { pda: account.pubkey, dataLength: buffer.length, offset: 8 });
             }
           }
         }
       } catch (e) { /* skip */ }
+    }
+    console.log(`[SAID On-Chain] Extracted ${candidateWallets.size} unique candidate wallets from offset 8`);
+
+    // Step 3: Batch validate candidates using getMultipleAccounts (100 at a time)
+    // Real wallets will have lamports > 0 or exist on-chain; garbage addresses won't
+    const allCandidates = [...candidateWallets.keys()];
+    const validWallets = new Set();
+    const batchSize = 100;
+    for (let i = 0; i < allCandidates.length; i += batchSize) {
+      const batch = allCandidates.slice(i, i + batchSize);
+      try {
+        const validateResponse = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getMultipleAccounts', params: [batch, { encoding: 'base64', commitment: 'confirmed' }] })
+        });
+        const validateResult = await validateResponse.json();
+        const accountResults = validateResult.result?.value || [];
+        for (let j = 0; j < accountResults.length; j++) {
+          if (accountResults[j] !== null) {
+            validWallets.add(batch[j]);
+          }
+        }
+      } catch (e) { console.warn('[SAID On-Chain] Batch validation error:', e.message); }
+      await new Promise(resolve => setTimeout(resolve, 50)); // rate limit
+    }
+    console.log(`[SAID On-Chain] Validated ${validWallets.size}/${candidateWallets.size} wallets exist on-chain`);
+
+    // Step 4: Return only validated wallets
+    const agents = [];
+    for (const [wallet, meta] of candidateWallets) {
+      if (validWallets.has(wallet)) {
+        agents.push({ pda: meta.pda, wallet, dataLength: meta.dataLength, layout: `offset-${meta.offset}` });
+      }
       if (agents.length >= limit) break;
     }
+    console.log(`[SAID On-Chain] Returning ${agents.length} validated agent wallets`);
     return agents;
   } catch (e) { console.error('[SAID On-Chain] Error:', e.message); return []; }
 }
@@ -508,7 +555,7 @@ async function getOrCreateAgent(wallet) {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '12.2.0',
+    version: '12.3.0',
     description: 'The Trust & Discovery Layer for Solana AI Agents',
     api: { v1: { 'GET /v1/score?wallet=': 'Score any Solana wallet', 'POST /v1/score/batch': 'Score up to 25 wallets', 'GET /v1/health': 'Health check' } },
     endpoints: {
@@ -724,7 +771,7 @@ app.get('/stats', (req, res) => {
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Registry v12.2 on port ${CONFIG.PORT}`);
+  console.log(`FairScale Registry v12.3 on port ${CONFIG.PORT}`);
   console.log(`  Integrations: FairScale API, SAID Protocol (on-chain PDA), ERC-8004, ClawKey (VeryAI)`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
