@@ -727,51 +727,36 @@ function calculateAgentFeatures(fairscaleData) {
   return { reliability, track_record, economic_stake, ecosystem };
 }
 
-// --- VERIFICATION SCORE (25% of composite) ---
-// This is the big one: protocol registrations and human verification
-// are first-class trust signals, not just bonuses
+// --- VERIFICATION SCORE (25-30% of composite) ---
+// Tiered scoring based on verification breadth and depth
 function calculateVerificationScore(wallet, saidData, verifications) {
   let score = 0;
-  let maxPossible = 0;
 
-  // SAID Protocol on-chain PDA (registered as agent)
-  maxPossible += 20;
-  if (REGISTRY.saidAgents.has(wallet)) score += 20;
+  // Protocol registrations (core verification)
+  const onSaid = REGISTRY.saidAgents.has(wallet);
+  const on8004 = REGISTRY.erc8004ByWallet.has(wallet);
+  const onSati = REGISTRY.satiByWallet.has(wallet);
+  const registryCount = (onSaid ? 1 : 0) + (on8004 ? 1 : 0) + (onSati ? 1 : 0);
 
-  // ERC-8004 Solana Agent Registry (registered, paid gas)
-  maxPossible += 25;
-  if (REGISTRY.erc8004ByWallet.has(wallet)) score += 25;
+  // Base: any registry = meaningful verification
+  if (registryCount >= 1) score += 35;
+  if (registryCount >= 2) score += 20;  // Dual = 55 base
+  if (registryCount >= 3) score += 10;  // Triple = 65 base
 
-  // SATI (Solana Agent Trust Infrastructure) — Token-2022 NFT registration
-  maxPossible += 25;
-  if (REGISTRY.satiByWallet.has(wallet)) score += 25;
-
-  // ClawKey human verification (strongest signal)
-  maxPossible += 30;
-  if (verifications?.clawkey?.verified) score += 30;
-
-  // FairScale self-registration
-  maxPossible += 5;
-  if (REGISTRY.registeredAgents.has(wallet)) score += 5;
-
-  // Payment verification ($5 USDC)
-  maxPossible += 10;
-  if (REGISTRY.verifiedWallets.has(wallet)) score += 10;
+  // Human verification (strongest individual signal)
+  if (verifications?.clawkey?.verified) score += 25;
 
   // SAID reputation tier
-  maxPossible += 10;
-  if (saidData?.reputation?.trustTier === 'high') score += 10;
-  else if (saidData?.reputation?.trustTier === 'medium') score += 5;
+  if (saidData?.reputation?.trustTier === 'high') score += 8;
+  else if (saidData?.reputation?.trustTier === 'medium') score += 4;
 
-  // Multi-registry bonuses
-  const registryCount = (REGISTRY.saidAgents.has(wallet) ? 1 : 0) +
-    (REGISTRY.erc8004ByWallet.has(wallet) ? 1 : 0) +
-    (REGISTRY.satiByWallet.has(wallet) ? 1 : 0);
-  if (registryCount >= 3) score += 15;      // Triple registry — exceptional
-  else if (registryCount >= 2) score += 10;  // Dual registry — strong signal
+  // Self-registration on FairScale
+  if (REGISTRY.registeredAgents.has(wallet)) score += 3;
 
-  // Normalize to 0-100
-  return clamp((score / maxPossible) * 100, 0, 100);
+  // Payment verification
+  if (REGISTRY.verifiedWallets.has(wallet)) score += 7;
+
+  return clamp(score, 0, 100);
 }
 
 // --- SOCIAL & REPUTATION SCORE (15% of composite) ---
@@ -831,52 +816,42 @@ function detectRedFlags(fairscaleData) {
   let penalty = 0;
   const flags = [];
 
-  // New wallet with very high volume = potential sybil/airdrop farmer
+  // New wallet with extreme volume = potential sybil/airdrop farmer
   const ageDays = f.wallet_age_days || 0;
   const txCount = f.tx_count || 0;
-  if (ageDays < 7 && txCount > 100) {
-    penalty -= 5;
-    flags.push('new_wallet_high_volume');
-  } else if (ageDays < 14 && txCount > 200) {
-    penalty -= 3;
-    flags.push('new_wallet_high_volume');
+  if (ageDays < 3 && txCount > 200) {
+    penalty -= 4;
+    flags.push('new_wallet_extreme_volume');
   }
 
-  // Single protocol usage with high tx = bot (only flag if extremely concentrated)
+  // Single protocol usage with very high tx = bot
   const diversity = f.platform_diversity || 0;
-  if (diversity <= 1 && txCount > 100) {
-    penalty -= 4;
+  if (diversity <= 1 && txCount > 200) {
+    penalty -= 3;
     flags.push('single_protocol_bot');
   }
 
   // Extremely rapid transactions = spam bot
   const gapHours = f.median_gap_hours || 0;
-  if (gapHours > 0 && gapHours < 0.05) {
-    penalty -= 4;
+  if (gapHours > 0 && gapHours < 0.02) {
+    penalty -= 3;
     flags.push('spam_bot_speed');
   }
 
   // Instant dumps = exploitative
   if (f.no_instant_dumps === false || f.no_instant_dumps === 0) {
-    penalty -= 3;
+    penalty -= 2;
     flags.push('instant_dumps');
   }
 
   // Heavy SOL drain in last 30d = possible rug/exit
   const netFlow = f.net_sol_flow_30d || 0;
-  if (netFlow < -10) {
-    penalty -= 3;
+  if (netFlow < -20) {
+    penalty -= 2;
     flags.push('heavy_sol_drain');
   }
 
-  // Very high burst ratio = erratic, potentially manipulative
-  const burstRatio = f.burst_ratio || 0;
-  if (burstRatio > 0.85) {
-    penalty -= 2;
-    flags.push('high_burst_ratio');
-  }
-
-  return { penalty: Math.max(penalty, -15), flags };
+  return { penalty: Math.max(penalty, -10), flags };
 }
 
 // --- TIME DECAY ---
