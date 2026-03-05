@@ -949,6 +949,35 @@ function getFeatureDescription(feature, value) {
   return descs[feature]?.[tier] || '';
 }
 
+// Generate a one-line trust summary explaining why the agent scored high or low
+function generateTrustSummary(score, features, breakdown, verifications, red_flags) {
+  const v = verifications || {};
+  const registries = [v.said_onchain && 'SAID', v.erc8004 && '8004', v.sati && 'SATI'].filter(Boolean);
+  const hasClawKey = v.clawkey?.verified;
+  const flagCount = (red_flags || []).length;
+  const reliability = features?.reliability || 0;
+  const verification = features?.verification || 0;
+  const attestBoost = breakdown?.attestation_boost || 0;
+
+  if (score >= 75) {
+    if (hasClawKey && registries.length >= 2) return `Human-verified agent on ${registries.join(' + ')} with strong on-chain behavior. Highly trustworthy.`;
+    if (registries.length >= 2) return `Multi-registry agent (${registries.join(' + ')}) with consistent, reliable on-chain activity.`;
+    return `High-quality wallet with strong behavioral signals across all trust pillars.`;
+  }
+  if (score >= 55) {
+    if (registries.length >= 1 && reliability >= 60) return `Registered on ${registries.join(' + ')} with solid reliability. Good trust baseline.`;
+    if (reliability >= 70) return `Strong on-chain behavior but limited protocol verification. Score would improve with registry registration.`;
+    return `Moderate trust profile. Verified on-chain activity with room for improvement in ${verification < 30 ? 'verification' : 'behavioral consistency'}.`;
+  }
+  if (score >= 40) {
+    if (flagCount > 0) return `Some trust signals present but flagged for ${red_flags.map(f => f.replace(/_/g, ' ')).join(', ')}. Proceed with caution.`;
+    if (verification < 20) return `On-chain activity detected but no protocol registrations. Unverified agent — limited trust.`;
+    return `Basic trust signals present. Limited track record or behavioral data to assess fully.`;
+  }
+  if (flagCount > 0) return `Low trust score with ${flagCount} flag${flagCount > 1 ? 's' : ''}. Insufficient verification and behavioral concerns.`;
+  return `Minimal on-chain data available. New or inactive wallet with no protocol registrations.`;
+}
+
 // =============================================================================
 // AGENT FAIRSCORE COMPOSITE
 // =============================================================================
@@ -999,14 +1028,18 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
     (features.ecosystem * weights.ecosystem)
   );
 
-  // Attestation graph boost (up to +8 points)
+  // Attestation graph boost (up to +15 points)
+  // High-quality attestations from trusted agents are worth significantly more
   const graphData = REGISTRY.attestationGraph.get(wallet);
   let attestationBoost = 0;
   if (graphData) {
     const count = graphData.attester_count || 0;
     const wScore = graphData.weighted_score || 0;
-    // More attesters + higher quality attesters = bigger boost
-    attestationBoost = Math.min(Math.round((count * 1.5) + (wScore * 0.04)), 8);
+    const highAttester = graphData.highest_attester || 0;
+    attestationBoost = Math.min(
+      Math.round((count * 2) + (wScore * 0.08) + (highAttester > 70 ? 3 : 0)),
+      15
+    );
   }
 
   let blended = (fsBaseNormalized * 0.35) + (trustComposite * 0.65) + attestationBoost;
@@ -1193,6 +1226,12 @@ async function getOrCreateAgent(wallet) {
       verification: getFeatureDescription('verification', breakdown.verification),
       social: getFeatureDescription('social', breakdown.social),
     },
+    trust_summary: generateTrustSummary(agentFairScore, { ...features, verification: breakdown.verification }, breakdown, {
+      said_onchain: REGISTRY.saidAgents.has(wallet),
+      erc8004: REGISTRY.erc8004ByWallet.has(wallet),
+      sati: REGISTRY.satiByWallet.has(wallet),
+      clawkey: verifications.clawkey,
+    }, breakdown.red_flags),
     isRegistered: REGISTRY.registeredAgents.has(wallet),
     isSaidAgent: REGISTRY.saidAgents.has(wallet),
     isVerified: REGISTRY.verifiedWallets.has(wallet),
@@ -1471,7 +1510,7 @@ app.get('/score', async (req, res) => {
   if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
   const agent = await getOrCreateAgent(wallet);
   if (!agent) return res.status(404).json({ error: 'Could not fetch data', wallet });
-  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: agent.attestation_graph, score_trend: agent.score_trend, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services });
+  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: agent.attestation_graph, score_trend: agent.score_trend, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services });
 });
 
 // --- Registration ---
