@@ -636,6 +636,45 @@ async function verifyPayment(senderWallet) {
   } catch (e) { return { verified: false, error: e.message }; }
 }
 
+// --- DESCRIPTION QUALITY SIGNAL ---
+// Agents with detailed, specific descriptions about what they do are more likely legitimate.
+// Measures: length, specificity keywords, professional indicators, red-flag language.
+function scoreDescriptionQuality(description) {
+  if (!description || description.length < 10) return 0;
+  let score = 0;
+  const d = description.toLowerCase();
+  const len = description.length;
+
+  // Length: longer, more detailed descriptions indicate effort
+  if (len >= 30) score += 10;
+  if (len >= 80) score += 10;
+  if (len >= 150) score += 5;
+
+  // Professional/specific keywords indicating real utility
+  const proKeywords = ['api', 'analytics', 'trading', 'defi', 'monitor', 'track', 'data', 'automat', 'manage',
+    'portfolio', 'alert', 'intelligence', 'market', 'liquidity', 'yield', 'strategy', 'research',
+    'content', 'social', 'community', 'governance', 'security', 'audit', 'report', 'index',
+    'oracle', 'bridge', 'swap', 'lend', 'borrow', 'stake', 'nft', 'token', 'protocol',
+    'payment', 'invoice', 'escrow', 'wallet', 'custody', 'compliance', 'kyc', 'identity',
+    'mcp', 'a2a', 'x402', 'solana', 'agent'];
+  const matches = proKeywords.filter(k => d.includes(k)).length;
+  score += Math.min(matches * 4, 30);
+
+  // Specificity: mentions specific protocols or tools
+  const specifics = ['jupiter', 'raydium', 'marinade', 'meteora', 'drift', 'kamino', 'marginfi',
+    'tensor', 'magic eden', 'helius', 'birdeye', 'dexscreener', 'polymarket', 'hyperliquid',
+    'openai', 'anthropic', 'claude', 'gpt'];
+  const specificMatches = specifics.filter(k => d.includes(k)).length;
+  score += Math.min(specificMatches * 8, 24);
+
+  // Red-flag language that suggests spam/scam
+  const redFlags = ['guaranteed', 'free money', '100x', 'moonshot', 'send sol', 'dm me', 'airdrop claim'];
+  const hasRedFlag = redFlags.some(k => d.includes(k));
+  if (hasRedFlag) score = Math.max(score - 20, 0);
+
+  return clamp(score, 0, 100);
+}
+
 // =============================================================================
 // SCORING
 // =============================================================================
@@ -727,34 +766,33 @@ function calculateAgentFeatures(fairscaleData) {
   return { reliability, track_record, economic_stake, ecosystem };
 }
 
-// --- VERIFICATION SCORE (25-30% of composite) ---
-// Tiered scoring based on verification breadth and depth
+// --- VERIFICATION SCORE (30-35% of composite) ---
+// This is the DOMINANT trust signal. Protocol registrations prove intent and commitment.
 function calculateVerificationScore(wallet, saidData, verifications) {
   let score = 0;
 
-  // Protocol registrations (core verification)
   const onSaid = REGISTRY.saidAgents.has(wallet);
   const on8004 = REGISTRY.erc8004ByWallet.has(wallet);
   const onSati = REGISTRY.satiByWallet.has(wallet);
   const registryCount = (onSaid ? 1 : 0) + (on8004 ? 1 : 0) + (onSati ? 1 : 0);
 
-  // Base: any registry = meaningful verification
-  if (registryCount >= 1) score += 35;
-  if (registryCount >= 2) score += 20;  // Dual = 55 base
-  if (registryCount >= 3) score += 10;  // Triple = 65 base
+  // Base: any registry = strong verification signal
+  if (registryCount >= 1) score += 40;
+  if (registryCount >= 2) score += 25;  // Dual = 65 base
+  if (registryCount >= 3) score += 10;  // Triple = 75 base
 
-  // Human verification (strongest individual signal)
-  if (verifications?.clawkey?.verified) score += 25;
+  // Human verification (ClawKey)
+  if (verifications?.clawkey?.verified) score += 20;
 
   // SAID reputation tier
   if (saidData?.reputation?.trustTier === 'high') score += 8;
   else if (saidData?.reputation?.trustTier === 'medium') score += 4;
 
-  // Self-registration on FairScale
-  if (REGISTRY.registeredAgents.has(wallet)) score += 3;
+  // Payment verification ($5 USDC — skin in the game)
+  if (REGISTRY.verifiedWallets.has(wallet)) score += 10;
 
-  // Payment verification
-  if (REGISTRY.verifiedWallets.has(wallet)) score += 7;
+  // Self-registration
+  if (REGISTRY.registeredAgents.has(wallet)) score += 3;
 
   return clamp(score, 0, 100);
 }
@@ -952,37 +990,50 @@ function getFeatureDescription(feature, value) {
 // Generate a one-line trust summary explaining why the agent scored high or low
 function generateTrustSummary(score, features, breakdown, verifications, red_flags) {
   const v = verifications || {};
-  const registries = [v.said_onchain && 'SAID', v.erc8004 && '8004', v.sati && 'SATI'].filter(Boolean);
+  const registries = [v.said_onchain && 'SAID', v.erc8004 && 'ERC-8004', v.sati && 'SATI'].filter(Boolean);
   const hasClawKey = v.clawkey?.verified;
   const flagCount = (red_flags || []).length;
   const reliability = features?.reliability || 0;
   const verification = features?.verification || 0;
-  const attestBoost = breakdown?.attestation_boost || 0;
+  const trackRecord = features?.track_record || 0;
+  const ecosystem = features?.ecosystem || 0;
+  const descQuality = breakdown?.desc_quality || 0;
+
+  const strengths = [];
+  if (reliability >= 70) strengths.push('strong behavioral consistency');
+  if (ecosystem >= 70) strengths.push('active across multiple protocols');
+  if (trackRecord >= 60) strengths.push('established track record');
+  if (descQuality >= 40) strengths.push('well-documented capabilities');
+  if (hasClawKey) strengths.push('human-verified identity');
+
+  const weaknesses = [];
+  if (verification < 30 && registries.length === 0) weaknesses.push('no protocol registrations');
+  if (reliability < 30) weaknesses.push('limited behavioral data');
+  if (trackRecord < 25) weaknesses.push('short history');
 
   if (score >= 75) {
-    if (hasClawKey && registries.length >= 2) return `Human-verified agent on ${registries.join(' + ')} with strong on-chain behavior. Highly trustworthy.`;
-    if (registries.length >= 2) return `Multi-registry agent (${registries.join(' + ')}) with consistent, reliable on-chain activity.`;
-    return `High-quality wallet with strong behavioral signals across all trust pillars.`;
+    const detail = strengths.length ? ` Strengths: ${strengths.slice(0, 3).join(', ')}.` : '';
+    if (registries.length >= 2) return `Multi-registry verified agent (${registries.join(' + ')}) with high trust across all pillars.${detail} Suitable for high-value interactions and credit.`;
+    return `High-trust agent with excellent on-chain behavior.${detail} Suitable for most agent interactions.`;
   }
   if (score >= 55) {
-    if (registries.length >= 1 && reliability >= 60) return `Registered on ${registries.join(' + ')} with solid reliability. Good trust baseline.`;
-    if (reliability >= 70) return `Strong on-chain behavior but limited protocol verification. Score would improve with registry registration.`;
-    return `Moderate trust profile. Verified on-chain activity with room for improvement in ${verification < 30 ? 'verification' : 'behavioral consistency'}.`;
+    const detail = strengths.length ? ` Strengths: ${strengths.slice(0, 2).join(', ')}.` : '';
+    const improve = weaknesses.length ? ` Could improve: ${weaknesses[0]}.` : '';
+    if (registries.length >= 1) return `Verified on ${registries.join(' + ')} with good trust fundamentals.${detail}${improve}`;
+    return `Moderate trust profile with decent on-chain activity.${detail}${improve} Registry verification would boost score significantly.`;
   }
   if (score >= 40) {
-    if (flagCount > 0) return `Some trust signals present but flagged for ${red_flags.map(f => f.replace(/_/g, ' ')).join(', ')}. Proceed with caution.`;
-    if (verification < 20) return `On-chain activity detected but no protocol registrations. Unverified agent — limited trust.`;
-    return `Basic trust signals present. Limited track record or behavioral data to assess fully.`;
+    const issue = weaknesses.length ? weaknesses.join(', ') : 'limited overall data';
+    return `Basic trust level — ${issue}. ${flagCount > 0 ? `Flagged: ${red_flags.map(f => f.replace(/_/g, ' ')).join(', ')}. ` : ''}Exercise caution. Not recommended for credit.`;
   }
-  if (flagCount > 0) return `Low trust score with ${flagCount} flag${flagCount > 1 ? 's' : ''}. Insufficient verification and behavioral concerns.`;
-  return `Minimal on-chain data available. New or inactive wallet with no protocol registrations.`;
+  return `Low trust. ${weaknesses.length ? weaknesses.join(', ') + '. ' : ''}${flagCount > 0 ? `${flagCount} flag${flagCount > 1 ? 's' : ''} detected. ` : ''}Not suitable for unsupervised operations or lending.`;
 }
 
 // =============================================================================
 // AGENT FAIRSCORE COMPOSITE
 // =============================================================================
 
-function calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications = {}, taskProfile = null) {
+function calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications = {}, taskProfile = null, descQuality = 0) {
   // CRITICAL: Use fairscore_base (wallet-only, max ~80 without social) and normalize to 0-100.
   // FairScale's combined `fairscore` includes social_score (20/100 of total).
   // If we use combined as our base AND have a separate social pillar, we double-penalize missing social.
@@ -1014,9 +1065,9 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
       weights.track_record += socialW * 0.2;
     }
   } else if (hasSocialData) {
-    weights = { verification: 0.25, reliability: 0.25, social: 0.15, track_record: 0.15, economic_stake: 0.10, ecosystem: 0.10 };
+    weights = { verification: 0.30, reliability: 0.25, social: 0.12, track_record: 0.15, economic_stake: 0.08, ecosystem: 0.10 };
   } else {
-    weights = { verification: 0.30, reliability: 0.30, social: 0, track_record: 0.20, economic_stake: 0.10, ecosystem: 0.10 };
+    weights = { verification: 0.35, reliability: 0.28, social: 0, track_record: 0.18, economic_stake: 0.09, ecosystem: 0.10 };
   }
 
   const trustComposite = (
@@ -1042,7 +1093,11 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
     );
   }
 
-  let blended = (fsBaseNormalized * 0.35) + (trustComposite * 0.65) + attestationBoost;
+  // Description quality boost (up to +5 points)
+  // Agents with detailed, specific descriptions about their utility are more credible
+  const descBoost = Math.min(Math.round(descQuality * 0.05), 5);
+
+  let blended = (fsBaseNormalized * 0.35) + (trustComposite * 0.65) + attestationBoost + descBoost;
 
   const { penalty, flags } = detectRedFlags(fairscaleData);
   blended += penalty;
@@ -1076,6 +1131,8 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
     ecosystem: features.ecosystem,
     attestation_boost: attestationBoost,
     attestation_data: graphData ? { count: graphData.attester_count, weighted_score: graphData.weighted_score, highest: graphData.highest_attester } : null,
+    desc_quality: descQuality,
+    desc_boost: descBoost,
     red_flag_penalty: penalty,
     red_flags: flags,
     time_decay: decay,
@@ -1161,7 +1218,12 @@ async function getOrCreateAgent(wallet) {
   } catch (e) { console.error('[Verifications]', e.message); }
 
   const features = calculateAgentFeatures(fairscaleData);
-  const scoreResult = calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications);
+  
+  // Resolve description for quality scoring
+  const agentDescription = regData?.description || erc8004Data?.description || satiData?.description || saidData?.identity?.description || null;
+  const descQuality = scoreDescriptionQuality(agentDescription);
+  
+  const scoreResult = calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications, null, descQuality);
   const agentFairScore = scoreResult.score;
   const breakdown = scoreResult.breakdown;
   const recommendation = getRecommendationTier(agentFairScore, verifications, wallet);
@@ -1192,6 +1254,7 @@ async function getOrCreateAgent(wallet) {
       ...features,
       verification: breakdown.verification,
       social: breakdown.social,
+      desc_quality: descQuality,
     },
     verifications: {
       clawkey: verifications.clawkey ? { verified: verifications.clawkey.verified, humanId: verifications.clawkey.humanId } : null,
