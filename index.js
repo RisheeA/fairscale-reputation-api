@@ -493,15 +493,50 @@ async function buildAttestationGraph() {
   if (!CONFIG.HELIUS_API_KEY) return;
 
   let processed = 0, totalAttestations = 0;
-  const wallets = Array.from(REGISTRY.satiByWallet.keys()).concat(
-    Array.from(REGISTRY.saidAgents.keys())
-  );
-  const uniqueWallets = [...new Set(wallets)];
 
-  for (const wallet of uniqueWallets) {
+  // Phase 1: Use SAID reputation data as attestation source
+  // SAID feedbackCount represents peer attestations within the SAID protocol
+  for (const [wallet] of REGISTRY.saidAgents) {
+    const agent = REGISTRY.agents.get(wallet);
+    if (!agent) continue;
+    const feedbackCount = agent.scores?.attestations || 0;
+    const saidRepScore = agent.scores?.said_score || 0;
+
+    if (feedbackCount > 0 || saidRepScore > 0) {
+      // Treat SAID reputation as implicit attestations
+      const attesters = [];
+      // Each feedback is an implicit attestation — we don't know the attester wallet
+      // but we can use the count and SAID's own reputation score as quality signal
+      for (let i = 0; i < Math.min(feedbackCount, 10); i++) {
+        attesters.push({
+          wallet: `said_feedback_${i}`,
+          score: saidRepScore > 0 ? Math.min(saidRepScore * 10, 80) : 40, // SAID score as quality proxy
+          timestamp: null, type: 'said_feedback', signature: null,
+        });
+      }
+
+      if (attesters.length > 0) {
+        const scored = attesters.filter(a => a.score != null);
+        const weightedSum = scored.reduce((s, a) => s + (a.score * a.score / 100), 0);
+        const totalWeight = scored.reduce((s, a) => s + a.score / 100, 0);
+        const weightedScore = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 0;
+
+        REGISTRY.attestationGraph.set(wallet, {
+          attesters, attester_count: attesters.length, scored_attesters: scored.length,
+          weighted_score: weightedScore,
+          highest_attester: Math.max(...scored.map(a => a.score)),
+          updated_at: new Date().toISOString(),
+        });
+        totalAttestations += attesters.length;
+      }
+    }
+    processed++;
+  }
+
+  // Phase 2: Scan for SATI/SAS on-chain attestations (supplements SAID data)
+  const satiWallets = Array.from(REGISTRY.satiByWallet.keys());
+  for (const wallet of satiWallets) {
     try {
-      // Query Helius for transactions to this wallet from the SAS/SATI programs
-      // This catches feedback/attestation transactions
       const r = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 'attest', method: 'getSignaturesForAddress',
@@ -510,7 +545,6 @@ async function buildAttestationGraph() {
       const sigs = (await r.json())?.result || [];
 
       const attesters = [];
-      // Check each transaction for attestation patterns (SAS or SATI program involvement)
       for (const sig of sigs.slice(0, 20)) {
         try {
           const txR = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
@@ -523,23 +557,18 @@ async function buildAttestationGraph() {
 
           const keys = tx.transaction.message.accountKeys || [];
           const programs = keys.map(k => typeof k === 'string' ? k : k.pubkey);
-
-          // Check if SATI or SAS program was involved
           const isSATI = programs.includes(CONFIG.SATI_PROGRAM);
           const isSAS = programs.includes(CONFIG.SAS_PROGRAM);
 
           if (isSATI || isSAS) {
-            // The signer (first key) is the attester
             const attesterWallet = typeof keys[0] === 'string' ? keys[0] : keys[0]?.pubkey;
             if (attesterWallet && attesterWallet !== wallet) {
-              // Get attester's FairScore if available
               const attesterAgent = REGISTRY.agents.get(attesterWallet);
               const attesterScore = attesterAgent?.scores?.agent_fairscore || null;
               attesters.push({
                 wallet: attesterWallet, score: attesterScore,
                 timestamp: sig.blockTime ? new Date(sig.blockTime * 1000).toISOString() : null,
-                type: isSATI ? 'sati_feedback' : 'sas_attestation',
-                signature: sig.signature,
+                type: isSATI ? 'sati_feedback' : 'sas_attestation', signature: sig.signature,
               });
               totalAttestations++;
             }
@@ -548,29 +577,25 @@ async function buildAttestationGraph() {
       }
 
       if (attesters.length > 0) {
-        // Calculate weighted attestation score
-        const scored = attesters.filter(a => a.score != null);
-        const unscored = attesters.filter(a => a.score == null);
-        // Weighted average: scored attesters weighted by their FairScore, unscored get default 40
-        const weightedSum = scored.reduce((s, a) => s + (a.score * a.score / 100), 0) // quadratic weighting
-          + unscored.length * 16; // default 40^2/100 = 16
+        const existing = REGISTRY.attestationGraph.get(wallet);
+        const merged = existing ? [...existing.attesters, ...attesters] : attesters;
+        const scored = merged.filter(a => a.score != null);
+        const unscored = merged.filter(a => a.score == null);
+        const weightedSum = scored.reduce((s, a) => s + (a.score * a.score / 100), 0) + unscored.length * 16;
         const totalWeight = scored.reduce((s, a) => s + a.score / 100, 0) + unscored.length * 0.4;
         const weightedScore = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 0;
 
         REGISTRY.attestationGraph.set(wallet, {
-          attesters,
-          attester_count: attesters.length,
-          scored_attesters: scored.length,
-          weighted_score: weightedScore,
-          highest_attester: scored.length > 0 ? Math.max(...scored.map(a => a.score)) : null,
+          attesters: merged, attester_count: merged.length, scored_attesters: scored.length,
+          weighted_score: weightedScore, highest_attester: scored.length > 0 ? Math.max(...scored.map(a => a.score)) : 0,
           updated_at: new Date().toISOString(),
         });
       }
-      processed++;
-      if (processed % 20 === 0) await new Promise(r => setTimeout(r, 200));
+      await new Promise(resolve => setTimeout(resolve, 200));
     } catch (e) {}
   }
-  console.log(`[Attestation Graph] Done: ${processed} wallets, ${totalAttestations} attestations found, ${REGISTRY.attestationGraph.size} with attestation data`);
+
+  console.log(`[Attestation Graph] Done: ${processed} SAID wallets processed, ${satiWallets.length} SATI wallets scanned, ${totalAttestations} attestations found, ${REGISTRY.attestationGraph.size} with attestation data`);
 }
 
 // =============================================================================
@@ -813,9 +838,14 @@ function calculateVerificationScore(wallet, saidData, verifications) {
   // Human verification (ClawKey)
   if (verifications?.clawkey?.verified) score += 20;
 
-  // SAID reputation tier
-  if (saidData?.reputation?.trustTier === 'high') score += 8;
-  else if (saidData?.reputation?.trustTier === 'medium') score += 4;
+  // SAID reputation tier (strong signal — SAID's own trust assessment)
+  if (saidData?.reputation?.trustTier === 'high') score += 12;
+  else if (saidData?.reputation?.trustTier === 'medium') score += 6;
+  else if (saidData?.reputation?.trustTier === 'low' && onSaid) score += 3;
+
+  // SAID reputation score (if available, additional bonus)
+  const saidRepScore = saidData?.reputation?.score || 0;
+  if (saidRepScore > 0) score += Math.min(Math.round(saidRepScore * 8), 10);
 
   // Payment verification ($5 USDC — skin in the game)
   if (REGISTRY.verifiedWallets.has(wallet)) score += 10;
@@ -953,11 +983,13 @@ function calculateTimeDecay(fairscaleData) {
 // Computes percentile rank across all scored agents in registry
 function computePercentiles(wallet, features, agentFairScore) {
   const allAgents = Array.from(REGISTRY.agents.values());
-  if (allAgents.length < 10) return null; // Not enough data
+  if (allAgents.length < 5) return null;
 
   const metrics = {
     agent_fairscore: agentFairScore,
+    verification: features.verification,
     reliability: features.reliability,
+    social: features.social,
     track_record: features.track_record,
     economic_stake: features.economic_stake,
     ecosystem: features.ecosystem,
@@ -965,14 +997,11 @@ function computePercentiles(wallet, features, agentFairScore) {
 
   const percentiles = {};
   for (const [key, value] of Object.entries(metrics)) {
-    let belowCount = 0;
-    let total = 0;
+    if (value == null) continue;
+    let belowCount = 0, total = 0;
     for (const a of allAgents) {
       const cmp = key === 'agent_fairscore' ? a.scores?.agent_fairscore : a.features?.[key];
-      if (cmp != null) {
-        total++;
-        if (cmp < value) belowCount++;
-      }
+      if (cmp != null) { total++; if (cmp < value) belowCount++; }
     }
     percentiles[key] = total > 0 ? Math.round((belowCount / total) * 100) : null;
   }
