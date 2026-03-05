@@ -77,9 +77,12 @@ async function getFairScaleScore(wallet, socialHandle = null) {
     let url = `${CONFIG.FAIRSCALE_API}/score?wallet=${encodeURIComponent(wallet)}`;
     if (socialHandle) url += `&twitter=${encodeURIComponent(socialHandle.replace('@', ''))}`;
     const response = await fetch(url,
-      { headers: { accept: 'application/json', fairkey: CONFIG.FAIRSCALE_API_KEY } }
+      { headers: { accept: 'application/json', fairkey: CONFIG.FAIRSCALE_API_KEY }, signal: AbortSignal.timeout(10000) }
     );
-    if (!response.ok) return null;
+    if (!response.ok) {
+      if (REGISTRY.agents.size < 5) console.warn(`[FairScale] HTTP ${response.status} for ${wallet.slice(0,8)}${socialHandle ? ' (with twitter)' : ''}`);
+      return null;
+    }
     return await response.json();
   } catch (e) { console.error('FairScale error:', e.message); return null; }
 }
@@ -1109,18 +1112,27 @@ async function getOrCreateAgent(wallet) {
     if (Date.now() - new Date(cached.lastUpdated).getTime() < 1800000) return cached;
   }
 
-  // Step 1: Get SAID data first (fast, needed for social handle)
-  const saidData = await getSAIDData(wallet);
-
-  // Step 2: Resolve social handle from all available sources
+  // Step 1: Call FairScale and SAID in parallel (fast)
   const regData = REGISTRY.registeredAgents.get(wallet);
   const satiData = REGISTRY.satiByWallet.get(wallet);
-  const socialHandle = saidData?.identity?.twitter || saidData?.identity?.x ||
-    regData?.twitter || satiData?.twitter || null;
+  
+  // Check if we already know a social handle from registration/SATI
+  const knownHandle = regData?.twitter || satiData?.twitter || null;
+  
+  const [fairscaleInitial, saidData] = await Promise.all([
+    getFairScaleScore(wallet, knownHandle),
+    getSAIDData(wallet)
+  ]);
 
-  // Step 3: Call FairScale with social handle if available (enables full 100-point scoring)
-  if (socialHandle && REGISTRY.agents.size < 5) console.log(`[Score] Passing social handle "${socialHandle}" to FairScale for ${wallet.slice(0,8)}`);
-  const fairscaleData = await getFairScaleScore(wallet, socialHandle);
+  // Step 2: If SAID gave us a social handle and FairScale didn't get social data, re-score with handle
+  let fairscaleData = fairscaleInitial;
+  const saidHandle = saidData?.identity?.twitter || saidData?.identity?.x || null;
+  if (saidHandle && !knownHandle && fairscaleInitial?.social_score === 0) {
+    if (REGISTRY.agents.size < 5) console.log(`[Score] Re-scoring ${wallet.slice(0,8)} with SAID handle "${saidHandle}"`);
+    const enriched = await getFairScaleScore(wallet, saidHandle);
+    if (enriched) fairscaleData = enriched;
+  }
+  const socialHandle = saidHandle || knownHandle;
 
   if (!fairscaleData && !saidData) {
     console.warn(`[Score] No data for ${wallet.slice(0,8)}... (both APIs returned null)`);
