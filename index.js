@@ -1055,7 +1055,8 @@ function generateTrustSummary(score, features, breakdown, verifications, red_fla
     const issue = weaknesses.length ? weaknesses.join(', ') : 'limited overall data';
     return `Basic trust level — ${issue}. ${flagCount > 0 ? `Flagged: ${red_flags.map(f => f.replace(/_/g, ' ')).join(', ')}. ` : ''}Exercise caution. Not recommended for credit.`;
   }
-  return `Low trust. ${weaknesses.length ? weaknesses.join(', ') + '. ' : ''}${flagCount > 0 ? `${flagCount} flag${flagCount > 1 ? 's' : ''} detected. ` : ''}Not suitable for unsupervised operations or lending.`;
+  if (registries.length >= 1) return `Verified on ${registries.join(' + ')} but limited on-chain data available. ${weaknesses.length ? weaknesses.join(', ') + '. ' : ''}Score may improve as more behavioral data becomes available.`;
+  return `Limited trust data. ${weaknesses.length ? weaknesses.join(', ') + '. ' : ''}${flagCount > 0 ? `${flagCount} flag${flagCount > 1 ? 's' : ''} detected. ` : ''}Additional verification and on-chain history would strengthen this profile.`;
 }
 
 // =============================================================================
@@ -1071,11 +1072,10 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
   const fsSocial = fairscaleData?.social_score || 0;
   const hasFSSocial = fsSocial > 0;
 
-  // Normalize base score: FairScale base is scored out of ~80 (100 minus 20 social allocation)
-  // A perfect on-chain wallet scores ~80 on fairscore_base. Normalize to 100.
+  // Normalize base score: FairScale base is out of ~80 without social
   const fsBaseNormalized = hasFSSocial
-    ? fsBase  // If social IS present, base may already be out of 80 and combined handles it
-    : Math.min(Math.round(fsBase * 1.25), 100);  // No social: 64/80 → 80/100
+    ? fsBase
+    : Math.min(Math.round(fsBase * 1.25), 100);
 
   const verificationScore = calculateVerificationScore(wallet, saidData, verifications);
   const socialScore = calculateSocialScore(fairscaleData, saidData);
@@ -1094,9 +1094,9 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
       weights.track_record += socialW * 0.2;
     }
   } else if (hasSocialData) {
-    weights = { verification: 0.30, reliability: 0.25, social: 0.12, track_record: 0.15, economic_stake: 0.08, ecosystem: 0.10 };
+    weights = { verification: 0.35, reliability: 0.22, social: 0.12, track_record: 0.13, economic_stake: 0.08, ecosystem: 0.10 };
   } else {
-    weights = { verification: 0.35, reliability: 0.28, social: 0, track_record: 0.18, economic_stake: 0.09, ecosystem: 0.10 };
+    weights = { verification: 0.40, reliability: 0.25, social: 0, track_record: 0.16, economic_stake: 0.09, ecosystem: 0.10 };
   }
 
   const trustComposite = (
@@ -1126,7 +1126,19 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
   // Agents with detailed, specific descriptions about their utility are more credible
   const descBoost = Math.min(Math.round(descQuality * 0.05), 5);
 
-  let blended = (fsBaseNormalized * 0.35) + (trustComposite * 0.65) + attestationBoost + descBoost;
+  // Multi-registry bonus: agents verified on 2+ protocols get a direct score boost
+  // This is THE strongest trust signal — separate from the pillar weighting
+  const onSaid = REGISTRY.saidAgents.has(wallet);
+  const on8004 = REGISTRY.erc8004ByWallet.has(wallet);
+  const onSati = REGISTRY.satiByWallet.has(wallet);
+  const registryCount = (onSaid ? 1 : 0) + (on8004 ? 1 : 0) + (onSati ? 1 : 0);
+  let multiRegistryBonus = 0;
+  if (registryCount >= 3) multiRegistryBonus = 15;
+  else if (registryCount >= 2) multiRegistryBonus = 10;
+
+  // Blend: 20% FairScale base, 80% trust composite + bonuses
+  // Trust composite is where verification, reliability, etc. live — it should dominate
+  let blended = (fsBaseNormalized * 0.20) + (trustComposite * 0.80) + attestationBoost + descBoost + multiRegistryBonus;
 
   const { penalty, flags } = detectRedFlags(fairscaleData);
   blended += penalty;
@@ -1148,6 +1160,7 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
     fs_base_raw: Math.round(fsBase),
     fs_base_normalized: Math.round(fsBaseNormalized),
     fs_social_raw: Math.round(fsSocial),
+    blend: { base_weight: 0.20, composite_weight: 0.80 },
     trust_composite: Math.round(trustComposite),
     verification: Math.round(verificationScore),
     social: Math.round(socialScore),
@@ -1162,6 +1175,7 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
     attestation_data: graphData ? { count: graphData.attester_count, weighted_score: graphData.weighted_score, highest: graphData.highest_attester } : null,
     desc_quality: descQuality,
     desc_boost: descBoost,
+    multi_registry_bonus: multiRegistryBonus,
     red_flag_penalty: penalty,
     red_flags: flags,
     time_decay: decay,
