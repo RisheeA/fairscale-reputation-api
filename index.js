@@ -924,6 +924,16 @@ function calculateAgentFeatures(fairscaleData) {
   return { reliability, track_record, economic_stake, ecosystem };
 }
 
+// Boost ecosystem score when counterparty data is available (called async after scan)
+function applyCounterpartyBoost(agent) {
+  if (!agent?.counterparties?.protocols?.length) return;
+  const trustedCount = agent.counterparties.protocols.length;
+  // Each known trusted protocol interaction adds to ecosystem quality
+  const boost = Math.min(trustedCount * 5, 20);
+  const currentEco = agent.features?.ecosystem || 0;
+  if (agent.features) agent.features.ecosystem = Math.min(currentEco + boost, 100);
+}
+
 // --- VERIFICATION SCORE (30-35% of composite) ---
 // This is the DOMINANT trust signal. Protocol registrations prove intent and commitment.
 function calculateVerificationScore(wallet, saidData, verifications) {
@@ -1017,40 +1027,37 @@ function detectRedFlags(fairscaleData) {
   let penalty = 0;
   const flags = [];
 
-  // New wallet with extreme volume = potential sybil/airdrop farmer
   const ageDays = f.wallet_age_days || 0;
   const txCount = f.tx_count || 0;
-  if (ageDays < 3 && txCount > 200) {
-    penalty -= 4;
-    flags.push('new_wallet_extreme_volume');
-  }
-
-  // Single protocol usage with very high tx = bot
   const diversity = f.platform_diversity || 0;
-  if (diversity <= 1 && txCount > 200) {
-    penalty -= 3;
-    flags.push('single_protocol_bot');
-  }
-
-  // Extremely rapid transactions = spam bot
   const gapHours = f.median_gap_hours || 0;
-  if (gapHours > 0 && gapHours < 0.02) {
-    penalty -= 3;
-    flags.push('spam_bot_speed');
-  }
-
-  // Instant dumps = exploitative
-  if (f.no_instant_dumps === false || f.no_instant_dumps === 0) {
-    penalty -= 2;
-    flags.push('instant_dumps');
-  }
-
-  // Heavy SOL drain in last 30d = possible rug/exit
   const netFlow = f.net_sol_flow_30d || 0;
-  if (netFlow < -20) {
-    penalty -= 2;
-    flags.push('heavy_sol_drain');
-  }
+  const convictionRatio = f.conviction_ratio || 0;
+  const burstRatio = f.burst_ratio || 0;
+
+  // New wallet with high volume
+  if (ageDays < 7 && txCount > 100) { penalty -= 3; flags.push('new_wallet_high_volume'); }
+
+  // Single protocol bot
+  if (diversity <= 1 && txCount > 100) { penalty -= 3; flags.push('single_protocol_bot'); }
+
+  // Spam-speed transactions
+  if (gapHours > 0 && gapHours < 0.05) { penalty -= 2; flags.push('rapid_transactions'); }
+
+  // Instant dumps
+  if (f.no_instant_dumps === false || f.no_instant_dumps === 0) { penalty -= 2; flags.push('instant_dumps'); }
+
+  // Heavy SOL drain
+  if (netFlow < -10) { penalty -= 2; flags.push('heavy_sol_drain'); }
+
+  // Low conviction — sells quickly, doesn't hold
+  if (convictionRatio < 0.3 && txCount > 20) { penalty -= 1; flags.push('low_conviction'); }
+
+  // Very high burst ratio — erratic transaction patterns
+  if (burstRatio > 0.9 && txCount > 30) { penalty -= 1; flags.push('erratic_activity'); }
+
+  // Very low diversity with meaningful activity
+  if (diversity <= 2 && diversity > 0 && txCount > 50) { penalty -= 1; flags.push('low_diversity'); }
 
   return { penalty: Math.max(penalty, -10), flags };
 }
@@ -1485,7 +1492,10 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
 
   // Async: scan counterparties in background (don't block agent creation)
   scanCounterparties(wallet).then(cp => {
-    if (cp && agent) agent.counterparties = cp;
+    if (cp && agent) {
+      agent.counterparties = cp;
+      applyCounterpartyBoost(agent);
+    }
   }).catch(() => {});
 
   REGISTRY.agents.set(wallet, agent);
@@ -1866,6 +1876,13 @@ app.get('/directory', (req, res) => {
   const offset = (page - 1) * limit;
   const paged = agents.slice(offset, offset + limit);
 
+  // Compute global rankings (once, outside the map)
+  const allSorted = Array.from(REGISTRY.agents.values())
+    .filter(ag => ag.scores?.agent_fairscore > 0)
+    .sort((x, y) => y.scores.agent_fairscore - x.scores.agent_fairscore);
+  const globalRankMap = new Map();
+  allSorted.forEach((ag, idx) => globalRankMap.set(ag.wallet, idx + 1));
+
   const result = paged.map((a, i) => {
     const onSaid = REGISTRY.saidAgents.has(a.wallet);
     const on8004 = !!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet);
@@ -1886,6 +1903,8 @@ app.get('/directory', (req, res) => {
 
     return {
       rank: offset + i + 1,
+      global_rank: globalRankMap.get(a.wallet) || null,
+      total_ranked: allSorted.length,
       wallet: a.wallet,
       name: a.erc8004?.name || a.name || `Agent ${a.wallet.slice(0, 8)}...`,
       agent_fairscore: a.scores.agent_fairscore,
