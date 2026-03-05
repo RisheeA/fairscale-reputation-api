@@ -703,6 +703,104 @@ async function scanCounterparties(wallet) {
 }
 
 // =============================================================================
+// FUNDING WALLET ANALYSIS
+// =============================================================================
+// Discover the wallet that originally funded this agent and score it.
+// A high-trust funder = positive signal. A flagged/low-trust funder = red flag.
+
+const KNOWN_EXCHANGES = new Map([
+  ['5tzFkiKscjHK98c1KS2VPkCz3MuKG1YB1RJMhZrPMiR2', 'Coinbase'],
+  ['2ojv9BAiHUrvsm9gxDe7fJSzbNZSJcxZvf8dqmWGHG8S', 'Binance'],
+  ['H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS', 'Coinbase Commerce'],
+  ['3yFwqXBfZY12a9p2bLqjzz3AVW5AuLTkQM5qXjnxLXYE', 'FTX (defunct)'],
+  ['ASTyfSima4LLAdDgoFGkgqoKowG1LZFDr9fAQrg7iaJZ', 'Kraken'],
+  ['4xDsmeTWPNjcG5pR3CHTAeRXKwi1XnUF87kv5qXquird', 'OKX'],
+]);
+
+async function discoverFundingWallet(wallet) {
+  if (!CONFIG.HELIUS_API_KEY) return null;
+  try {
+    // Get the earliest transaction for this wallet
+    const r = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'fund', method: 'getSignaturesForAddress',
+        params: [wallet, { limit: 1 }] }), // oldest transaction
+      signal: AbortSignal.timeout(8000),
+    });
+    const sigs = (await r.json())?.result || [];
+    if (sigs.length === 0) return null;
+
+    // Get the transaction to find who sent SOL
+    const txR = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'ftx', method: 'getTransaction',
+        params: [sigs[0].signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }] }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const tx = (await txR.json())?.result;
+    if (!tx?.transaction?.message) return null;
+
+    const keys = tx.transaction.message.accountKeys || [];
+    // The signer (first key) who isn't our wallet is likely the funder
+    let funderWallet = null;
+    for (const k of keys) {
+      const pubkey = typeof k === 'string' ? k : k.pubkey;
+      const isSigner = typeof k === 'object' ? k.signer : false;
+      if (pubkey && pubkey !== wallet && isSigner) {
+        funderWallet = pubkey;
+        break;
+      }
+    }
+    // Fallback: first key that isn't this wallet
+    if (!funderWallet) {
+      for (const k of keys) {
+        const pubkey = typeof k === 'string' ? k : k.pubkey;
+        if (pubkey && pubkey !== wallet && pubkey !== '11111111111111111111111111111111') {
+          funderWallet = pubkey;
+          break;
+        }
+      }
+    }
+    if (!funderWallet) return null;
+
+    // Check if it's a known exchange
+    const exchangeName = KNOWN_EXCHANGES.get(funderWallet);
+
+    // Score the funder wallet via FairScale
+    let funderScore = null;
+    try {
+      const fsR = await getFairScaleScore(funderWallet);
+      if (fsR?.fairscore_base != null) {
+        funderScore = Math.round(fsR.fairscore_base * 1.25); // normalize same as agent base
+      }
+    } catch (e) {}
+
+    // Also check if funder is a scored agent in our registry
+    const funderAgent = REGISTRY.agents.get(funderWallet);
+    const funderAgentScore = funderAgent?.scores?.agent_fairscore || null;
+
+    // Determine relationship quality
+    let relationship = 'unknown';
+    const bestScore = funderAgentScore || funderScore;
+    if (exchangeName) relationship = 'exchange';
+    else if (bestScore >= 70) relationship = 'high_trust';
+    else if (bestScore >= 40) relationship = 'moderate_trust';
+    else if (bestScore != null && bestScore < 25) relationship = 'low_trust';
+    else if (bestScore != null) relationship = 'neutral';
+
+    return {
+      wallet: funderWallet,
+      fairscore: funderScore,
+      agent_fairscore: funderAgentScore,
+      exchange: exchangeName || null,
+      relationship,
+      first_tx: sigs[0].blockTime ? new Date(sigs[0].blockTime * 1000).toISOString() : null,
+      signature: sigs[0].signature,
+    };
+  } catch (e) { return null; }
+}
+
+// =============================================================================
 // SCORE HISTORY
 // =============================================================================
 // Track score changes over time for trend analysis
@@ -1486,15 +1584,31 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
     isSaidAgent: REGISTRY.saidAgents.has(wallet),
     isVerified: REGISTRY.verifiedWallets.has(wallet),
     services: Array.from(REGISTRY.services.values()).filter(s => s.wallet === wallet),
-    counterparties: null, // populated lazily on first view
+    counterparties: null,
+    funder: null,
     lastUpdated: new Date().toISOString(),
   };
 
-  // Async: scan counterparties in background (don't block agent creation)
+  // Async: scan counterparties + discover funder in background
   scanCounterparties(wallet).then(cp => {
     if (cp && agent) {
       agent.counterparties = cp;
       applyCounterpartyBoost(agent);
+    }
+  }).catch(() => {});
+
+  discoverFundingWallet(wallet).then(funder => {
+    if (funder && agent) {
+      agent.funder = funder;
+      // Apply funder score impact to the agent
+      if (funder.relationship === 'low_trust') {
+        // Low-trust funder: slight negative impact
+        agent.scores.agent_fairscore = Math.max(agent.scores.agent_fairscore - 3, 5);
+        agent.red_flags = [...(agent.red_flags || []), 'low_trust_funder'];
+      } else if (funder.relationship === 'high_trust') {
+        // High-trust funder: slight positive
+        agent.scores.agent_fairscore = Math.min(agent.scores.agent_fairscore + 2, 100);
+      }
     }
   }).catch(() => {});
 
@@ -1769,7 +1883,7 @@ app.get('/score', async (req, res) => {
   if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
   const agent = await getOrCreateAgent(wallet);
   if (!agent) return res.status(404).json({ error: 'Could not fetch data', wallet });
-  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: agent.attestation_graph, score_trend: agent.score_trend, counterparties: agent.counterparties, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services });
+  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: agent.attestation_graph, score_trend: agent.score_trend, counterparties: agent.counterparties, funder: agent.funder, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services });
 });
 
 // --- Registration ---
