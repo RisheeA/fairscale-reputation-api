@@ -26,11 +26,21 @@ const CONFIG = {
   SAS_PROGRAM: 'attsHUrSzCyJqwjddBnTRFStKnPBHPbFTNsm8j22aVr',
   CLAWKEY_API: 'https://clawkey.ai/api',
   SCORE_HISTORY_MAX: 10,  // Keep last N snapshots per wallet
+  BETA_CODES: {
+    [process.env.BETA_CODE_ADMIN || 'Ch@os123']: { type: 'unlimited', maxUses: Infinity },
+    [process.env.BETA_CODE_INVITE || 'fAIRgent123']: { type: 'limited', maxUses: 20 },
+  },
+  ADMIN_KEY: process.env.ADMIN_KEY || 'fairscale-admin-2026',
 };
 
 // =============================================================================
 // IN-MEMORY REGISTRY
 // =============================================================================
+
+const BETA = {
+  users: new Map(),       // email -> { code, accessedAt, lastLogin, loginCount }
+  codeUses: new Map(),    // code -> count
+};
 
 const REGISTRY = {
   agents: new Map(),
@@ -1955,6 +1965,90 @@ app.get('/v1/attestation-graph', (req, res) => {
   const data = REGISTRY.attestationGraph.get(wallet);
   if (!data) return res.json({ wallet, attesters: [], attester_count: 0, weighted_score: 0, message: 'No attestation data found' });
   res.json({ wallet, ...data, meta: { provider: 'FairScale', version: 'v1' } });
+});
+
+// =============================================================================
+// BETA ACCESS GATE
+// =============================================================================
+
+// Validate an access code + register email
+app.post('/beta/validate', (req, res) => {
+  const { code, email } = req.body;
+  if (!code || !email) return res.status(400).json({ error: 'Missing code or email' });
+  const emailLower = email.toLowerCase().trim();
+
+  const codeDef = CONFIG.BETA_CODES[code];
+  if (!codeDef) return res.status(401).json({ error: 'Invalid access code' });
+
+  // Check usage limit
+  const currentUses = BETA.codeUses.get(code) || 0;
+  if (codeDef.type === 'limited' && currentUses >= codeDef.maxUses) {
+    return res.status(403).json({ error: 'Access code has reached its usage limit' });
+  }
+
+  // Register or update user
+  const existing = BETA.users.get(emailLower);
+  if (existing) {
+    existing.lastLogin = new Date().toISOString();
+    existing.loginCount = (existing.loginCount || 0) + 1;
+  } else {
+    BETA.users.set(emailLower, {
+      email: emailLower, code, accessedAt: new Date().toISOString(),
+      lastLogin: new Date().toISOString(), loginCount: 1,
+    });
+    // Only increment code usage for NEW users
+    if (codeDef.type === 'limited') {
+      BETA.codeUses.set(code, currentUses + 1);
+    }
+  }
+
+  console.log(`[Beta] Access granted: ${emailLower} (code: ${code.slice(0,4)}..., total users: ${BETA.users.size})`);
+  res.json({ success: true, email: emailLower });
+});
+
+// Login with existing email (no code needed)
+app.post('/beta/login', (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  const emailLower = email.toLowerCase().trim();
+
+  const user = BETA.users.get(emailLower);
+  if (!user) return res.status(401).json({ error: 'No account found. Use an access code first.' });
+
+  user.lastLogin = new Date().toISOString();
+  user.loginCount = (user.loginCount || 0) + 1;
+  console.log(`[Beta] Login: ${emailLower} (visit #${user.loginCount})`);
+  res.json({ success: true, email: emailLower });
+});
+
+// Admin: view all beta users (requires admin key)
+app.get('/beta/users', (req, res) => {
+  const { key } = req.query;
+  if (key !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+
+  const users = Array.from(BETA.users.values())
+    .sort((a, b) => new Date(b.accessedAt) - new Date(a.accessedAt));
+
+  const codeStats = {};
+  for (const [code, def] of Object.entries(CONFIG.BETA_CODES)) {
+    codeStats[code.slice(0, 4) + '...'] = {
+      type: def.type,
+      maxUses: def.maxUses === Infinity ? 'unlimited' : def.maxUses,
+      currentUses: BETA.codeUses.get(code) || 0,
+    };
+  }
+
+  res.json({
+    total_users: users.length,
+    code_stats: codeStats,
+    users: users.map(u => ({
+      email: u.email,
+      code: u.code.slice(0, 4) + '...',
+      signed_up: u.accessedAt,
+      last_login: u.lastLogin,
+      visits: u.loginCount,
+    })),
+  });
 });
 
 // =============================================================================
