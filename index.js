@@ -362,7 +362,11 @@ async function syncFrom8004() {
           const existing = REGISTRY.agents.get(agent.wallet);
           const tag = { assetId: agent.assetId, name: agent.name, services: agent.services, skills: agent.skills };
           if (!existing || Date.now() - new Date(existing.lastUpdated).getTime() > 600000) {
-            const scored = await getOrCreateAgent(agent.wallet, null);
+            let saidVerify = null;
+            if (REGISTRY.saidAgents.has(agent.wallet)) {
+              try { const r = await fetch(`${CONFIG.SAID_API}/api/verify/${agent.wallet}`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(2000) }); if (r.ok) saidVerify = await r.json(); } catch(e) {}
+            }
+            const scored = await getOrCreateAgent(agent.wallet, saidVerify);
             if (scored) { scored.erc8004 = tag; imported++; }
             else { failed++; }
           } else { existing.erc8004 = tag; imported++; }
@@ -389,11 +393,15 @@ async function syncFromSAID() {
     }
     console.log(`[SAID Sync] Phase 1: ${REGISTRY.saidAgents.size} wallets registered`);
 
-    // Phase 2: Score each wallet via FairScale only (pass null to skip redundant SAID API call)
-    // SAID data will be fetched on-demand when the agent is viewed, not during bulk sync
+    // Phase 2: Score each wallet. Quick SAID verify call for name/description (2s timeout, ok to fail)
     for (const [wallet] of REGISTRY.saidAgents) {
       try {
-        const result = await getOrCreateAgent(wallet, null);
+        let saidVerify = null;
+        try {
+          const r = await fetch(`${CONFIG.SAID_API}/api/verify/${wallet}`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(2000) });
+          if (r.ok) saidVerify = await r.json();
+        } catch(e) { /* timeout ok, continue without name */ }
+        const result = await getOrCreateAgent(wallet, saidVerify);
         if (result) imported++;
         else { skippedNull++; failed++; }
       } catch (e) { failed++; console.error(`[SAID Sync] Score failed for ${wallet.slice(0,8)}:`, e.message); }
