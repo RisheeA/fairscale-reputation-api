@@ -609,6 +609,100 @@ async function buildAttestationGraph() {
 }
 
 // =============================================================================
+// TRANSACTION COUNTERPARTY ANALYSIS
+// =============================================================================
+// Scan recent transactions to identify which protocols an agent interacts with
+
+const KNOWN_PROGRAMS = {
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4': 'Jupiter',
+  'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB': 'Jupiter v4',
+  'jupoNjAxXgZ4rjzxzPMP4oxduvQsQtZzyknqvzYNrNu': 'Jupiter DCA',
+  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8': 'Raydium',
+  'CAMMCzo5YL8w4VFF8KVHo7nYXQJsqYyPy6Me2ePPjVKi': 'Raydium CLMM',
+  'MARBLEaEkHytC8P4koeRjW2BiqJ2WByerv6SMNLeqNq': 'Marinade',
+  'MarBmsSgKXdrN1egZf5sqe1TMai9K1rChYNDJgjq7aD': 'Marinade',
+  'KLend2g3cP87ber41GjQGELLPS9REVHEUF9AT6kWp7u': 'Kamino',
+  'DjVE6JNiYqPL2QXyCUUh8rNjHrbz9hXHNYt99MQ59qw1': 'Orca',
+  'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc': 'Orca Whirlpools',
+  'MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA': 'Marginfi',
+  'dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH': 'Drift',
+  'TCMPhJdwDryooaGtiocG1u3xcYbRpiJzb283XfSsggi': 'Tensor',
+  'M2mx93ekt1fmXSVkTrUL9xVFHkmME8HTUi5Cyc5aF7K': 'Magic Eden',
+  'TSWAPaqyCSx2KABk68Shruf4rp7CxcNi8hAsbdwmHbN': 'Tensor Swap',
+  'So11111111111111111111111111111111111111112': 'SOL (System)',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA': 'Token Program',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL': 'Associated Token',
+  'ComputeBudget111111111111111111111111111111': 'Compute Budget',
+  'PhoeijTjjmEiAfm7VbHpfG2E4pNi1Bm3mz6gXo3CRj': 'Phoenix DEX',
+  'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX': 'Serum/OpenBook',
+  'opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EQMoYS': 'OpenBook v2',
+  'FLUXubRmkEi2q6K3Y9kBPg9248ggaZVsoSFhtJHSrm1X': 'FluxBeam',
+  'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo': 'Meteora',
+  'Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UG': 'Meteora DLMM',
+  'SSwpkEEcbUqx4vtoEByFjSkhKdCT862DNVb52nZg1UZ': 'Saber',
+  'SPoo1Ku8WFXoNDMHPsrGSTSG1Y47rzgn41SLUNakuHy': 'Stake Pool',
+  'stk9ApL5HeVAwPLr3TLhDXdZS8ptVu7zp6ov8HFDuMi': 'Staking (BlazeStake)',
+  'jCebN34bUfdeUYJT13J1yG16XWQpt5PDx6Mse9GUqhR': 'Jito',
+  'JitoSOLzSBP3b4bpPagqjH6nXjaz6QECxJB7hZEYgaN': 'Jito Staking',
+};
+
+// Filter out system/infra programs that aren't meaningful counterparties
+const SYSTEM_PROGRAMS = new Set([
+  'So11111111111111111111111111111111111111112', 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 'ComputeBudget111111111111111111111111111111',
+  '11111111111111111111111111111111',
+]);
+
+async function scanCounterparties(wallet) {
+  if (!CONFIG.HELIUS_API_KEY) return null;
+  try {
+    const r = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'cp', method: 'getSignaturesForAddress',
+        params: [wallet, { limit: 20 }] }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const sigs = (await r.json())?.result || [];
+    if (sigs.length === 0) return { protocols: [], raw_programs: [], tx_count: 0 };
+
+    const programCounts = {};
+    for (const sig of sigs) {
+      try {
+        const txR = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 'tx', method: 'getTransaction',
+            params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }] }),
+          signal: AbortSignal.timeout(5000),
+        });
+        const tx = (await txR.json())?.result;
+        if (!tx?.transaction?.message) continue;
+        const keys = tx.transaction.message.accountKeys || [];
+        for (const k of keys) {
+          const pubkey = typeof k === 'string' ? k : k.pubkey;
+          if (pubkey && !SYSTEM_PROGRAMS.has(pubkey)) {
+            programCounts[pubkey] = (programCounts[pubkey] || 0) + 1;
+          }
+        }
+      } catch (e) {}
+    }
+
+    // Map to known protocols
+    const protocols = [];
+    const unknown = [];
+    for (const [prog, count] of Object.entries(programCounts).sort((a, b) => b[1] - a[1])) {
+      const name = KNOWN_PROGRAMS[prog];
+      if (name && !name.includes('Token Program') && !name.includes('System') && !name.includes('Compute')) {
+        if (!protocols.find(p => p.name === name)) protocols.push({ name, program: prog, interactions: count });
+      } else if (count >= 2) {
+        unknown.push({ program: prog.slice(0, 8) + '...', interactions: count });
+      }
+    }
+
+    return { protocols: protocols.slice(0, 10), unknown_programs: unknown.slice(0, 5), tx_scanned: sigs.length };
+  } catch (e) { return null; }
+}
+
+// =============================================================================
 // SCORE HISTORY
 // =============================================================================
 // Track score changes over time for trend analysis
@@ -1385,8 +1479,14 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
     isSaidAgent: REGISTRY.saidAgents.has(wallet),
     isVerified: REGISTRY.verifiedWallets.has(wallet),
     services: Array.from(REGISTRY.services.values()).filter(s => s.wallet === wallet),
+    counterparties: null, // populated lazily on first view
     lastUpdated: new Date().toISOString(),
   };
+
+  // Async: scan counterparties in background (don't block agent creation)
+  scanCounterparties(wallet).then(cp => {
+    if (cp && agent) agent.counterparties = cp;
+  }).catch(() => {});
 
   REGISTRY.agents.set(wallet, agent);
   return agent;
@@ -1659,7 +1759,7 @@ app.get('/score', async (req, res) => {
   if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
   const agent = await getOrCreateAgent(wallet);
   if (!agent) return res.status(404).json({ error: 'Could not fetch data', wallet });
-  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: agent.attestation_graph, score_trend: agent.score_trend, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services });
+  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: agent.attestation_graph, score_trend: agent.score_trend, counterparties: agent.counterparties, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services });
 });
 
 // --- Registration ---
@@ -1965,6 +2065,91 @@ app.get('/v1/attestation-graph', (req, res) => {
   const data = REGISTRY.attestationGraph.get(wallet);
   if (!data) return res.json({ wallet, attesters: [], attester_count: 0, weighted_score: 0, message: 'No attestation data found' });
   res.json({ wallet, ...data, meta: { provider: 'FairScale', version: 'v1' } });
+});
+
+// --- Dashboard / Ecosystem Health ---
+app.get('/v1/dashboard', (req, res) => {
+  const allAgents = Array.from(REGISTRY.agents.values());
+  const scores = allAgents.map(a => a.scores?.agent_fairscore || 0).filter(s => s > 0);
+  const avgScore = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
+  const medianScore = scores.length ? scores.sort((a, b) => a - b)[Math.floor(scores.length / 2)] : 0;
+
+  // Score distribution buckets
+  const distribution = { '0-19': 0, '20-39': 0, '40-59': 0, '60-79': 0, '80-100': 0 };
+  scores.forEach(s => {
+    if (s < 20) distribution['0-19']++;
+    else if (s < 40) distribution['20-39']++;
+    else if (s < 60) distribution['40-59']++;
+    else if (s < 80) distribution['60-79']++;
+    else distribution['80-100']++;
+  });
+
+  // Verification rates
+  const verified = allAgents.filter(a => a.isSaidAgent || a.verifications?.erc8004 || a.verifications?.sati);
+  const dualVerified = allAgents.filter(a => {
+    let c = 0;
+    if (a.isSaidAgent) c++; if (a.verifications?.erc8004) c++; if (a.verifications?.sati) c++;
+    return c >= 2;
+  });
+
+  // Red flag rate
+  const flagged = allAgents.filter(a => (a.red_flags || []).length > 0);
+
+  // Recommendation breakdown
+  const tiers = { highly_recommended: 0, recommended: 0, acceptable: 0, caution: 0, unverified: 0 };
+  allAgents.forEach(a => { const t = a.recommendation?.tier; if (t && tiers[t] !== undefined) tiers[t]++; });
+
+  // Top protocols by agent usage (from counterparty data)
+  const protocolCounts = {};
+  allAgents.forEach(a => {
+    (a.counterparties?.protocols || []).forEach(p => {
+      protocolCounts[p.name] = (protocolCounts[p.name] || 0) + 1;
+    });
+  });
+  const topProtocols = Object.entries(protocolCounts)
+    .sort((a, b) => b[1] - a[1]).slice(0, 15)
+    .map(([name, agents]) => ({ name, agents }));
+
+  // Top 10 leaderboard
+  const leaderboard = allAgents
+    .filter(a => a.scores?.agent_fairscore > 0)
+    .sort((a, b) => (b.scores?.agent_fairscore || 0) - (a.scores?.agent_fairscore || 0))
+    .slice(0, 10)
+    .map((a, i) => ({
+      rank: i + 1, wallet: a.wallet, name: a.name, agent_fairscore: a.scores.agent_fairscore,
+      recommendation: a.recommendation, sources: [
+        a.isSaidAgent ? 'said' : null, a.verifications?.erc8004 ? 'erc8004' : null,
+        a.verifications?.sati ? 'sati' : null
+      ].filter(Boolean),
+    }));
+
+  res.json({
+    overview: {
+      total_agents: allAgents.length,
+      total_scored: scores.length,
+      average_score: avgScore,
+      median_score: medianScore,
+      highest_score: scores.length ? Math.max(...scores) : 0,
+      said_agents: REGISTRY.saidAgents.size,
+      erc8004_agents: REGISTRY.erc8004Agents.size,
+      sati_agents: REGISTRY.satiByWallet.size,
+    },
+    verification: {
+      verified_count: verified.length,
+      verified_rate: scores.length ? Math.round((verified.length / scores.length) * 100) : 0,
+      dual_verified: dualVerified.length,
+      dual_rate: scores.length ? Math.round((dualVerified.length / scores.length) * 100) : 0,
+    },
+    health: {
+      flagged_count: flagged.length,
+      flag_rate: scores.length ? Math.round((flagged.length / scores.length) * 100) : 0,
+      attestation_coverage: REGISTRY.attestationGraph.size,
+    },
+    score_distribution: distribution,
+    recommendation_tiers: tiers,
+    top_protocols: topProtocols,
+    leaderboard,
+  });
 });
 
 // =============================================================================
