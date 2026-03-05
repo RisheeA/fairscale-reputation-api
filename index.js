@@ -73,18 +73,38 @@ function encodeBase58(bytes) {
 // =============================================================================
 
 async function getFairScaleScore(wallet, socialHandle = null) {
-  try {
-    let url = `${CONFIG.FAIRSCALE_API}/score?wallet=${encodeURIComponent(wallet)}`;
-    if (socialHandle) url += `&twitter=${encodeURIComponent(socialHandle.replace('@', ''))}`;
-    const response = await fetch(url,
-      { headers: { accept: 'application/json', fairkey: CONFIG.FAIRSCALE_API_KEY }, signal: AbortSignal.timeout(10000) }
-    );
-    if (!response.ok) {
-      if (REGISTRY.agents.size < 5) console.warn(`[FairScale] HTTP ${response.status} for ${wallet.slice(0,8)}${socialHandle ? ' (with twitter)' : ''}`);
+  const maxRetries = 3;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      let url = `${CONFIG.FAIRSCALE_API}/score?wallet=${encodeURIComponent(wallet)}`;
+      if (socialHandle) url += `&twitter=${encodeURIComponent(socialHandle.replace('@', ''))}`;
+      const response = await fetch(url,
+        { headers: { accept: 'application/json', fairkey: CONFIG.FAIRSCALE_API_KEY }, signal: AbortSignal.timeout(10000) }
+      );
+      if (response.status === 429) {
+        // Rate limited — exponential backoff
+        const delay = Math.pow(2, attempt) * 1000 + Math.random() * 500;
+        if (attempt < maxRetries - 1) {
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        return null;
+      }
+      if (!response.ok) {
+        if (REGISTRY.agents.size < 5) console.warn(`[FairScale] HTTP ${response.status} for ${wallet.slice(0,8)}`);
+        return null;
+      }
+      return await response.json();
+    } catch (e) {
+      if (attempt < maxRetries - 1) {
+        await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 500));
+        continue;
+      }
+      console.error('FairScale error:', e.message);
       return null;
     }
-    return await response.json();
-  } catch (e) { console.error('FairScale error:', e.message); return null; }
+  }
+  return null;
 }
 
 async function getSAIDData(wallet) {
@@ -243,7 +263,7 @@ async function fetch8004Agents(limit = 500) {
         if (items.length === 0) break;
         for (const item of items) { const a = parse8004Asset(item); if (a) agents.push(a); }
         page++;
-        await new Promise(resolve => setTimeout(resolve, 150));
+        await new Promise(resolve => setTimeout(resolve, 600));
       }
       console.log(`[8004 Sync] getAssetsByGroup: ${agents.length} agents`);
       if (agents.length > 0) return agents;
@@ -263,7 +283,7 @@ async function fetch8004Agents(limit = 500) {
       if (items.length === 0) break;
       for (const item of items) { const a = parse8004Asset(item); if (a) agents.push(a); }
       page++;
-      await new Promise(resolve => setTimeout(resolve, 150));
+      await new Promise(resolve => setTimeout(resolve, 600));
     }
     console.log(`[8004 Sync] getAssetsByCreator: ${agents.length} agents`);
     if (agents.length > 0) return agents;
@@ -342,12 +362,12 @@ async function syncFrom8004() {
           const existing = REGISTRY.agents.get(agent.wallet);
           const tag = { assetId: agent.assetId, name: agent.name, services: agent.services, skills: agent.skills };
           if (!existing || Date.now() - new Date(existing.lastUpdated).getTime() > 600000) {
-            const scored = await getOrCreateAgent(agent.wallet);
+            const scored = await getOrCreateAgent(agent.wallet, null);
             if (scored) { scored.erc8004 = tag; imported++; }
             else { failed++; }
           } else { existing.erc8004 = tag; imported++; }
         } else { nullWallets++; }
-        await new Promise(resolve => setTimeout(resolve, 150));
+        await new Promise(resolve => setTimeout(resolve, 600));
       } catch (e) { failed++; console.error(`[8004 Sync] Error scoring agent:`, e.message); }
     }
     console.log(`[8004 Sync] Done: ${imported} scored, ${enriched} metadata, ${nullWallets} null wallets, ${failed} failed / ${rawAgents.length}`);
@@ -369,14 +389,15 @@ async function syncFromSAID() {
     }
     console.log(`[SAID Sync] Phase 1: ${REGISTRY.saidAgents.size} wallets registered`);
 
-    // Phase 2: Score each wallet via FairScale + SAID verify
+    // Phase 2: Score each wallet via FairScale only (pass null to skip redundant SAID API call)
+    // SAID data will be fetched on-demand when the agent is viewed, not during bulk sync
     for (const [wallet] of REGISTRY.saidAgents) {
       try {
-        const result = await getOrCreateAgent(wallet);
+        const result = await getOrCreateAgent(wallet, null);
         if (result) imported++;
         else { skippedNull++; failed++; }
       } catch (e) { failed++; console.error(`[SAID Sync] Score failed for ${wallet.slice(0,8)}:`, e.message); }
-      await new Promise(resolve => setTimeout(resolve, 150));
+      await new Promise(resolve => setTimeout(resolve, 600));
     }
     console.log(`[SAID Sync] Scoring: ${imported} imported, ${skippedNull} null responses, ${failed - skippedNull} errors`);
 
@@ -1171,29 +1192,33 @@ function getRecommendationTier(score, verifications, wallet) {
 // AGENT MANAGEMENT
 // =============================================================================
 
-async function getOrCreateAgent(wallet) {
+async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
   if (REGISTRY.agents.has(wallet)) {
     const cached = REGISTRY.agents.get(wallet);
     if (Date.now() - new Date(cached.lastUpdated).getTime() < 1800000) return cached;
   }
 
-  // Step 1: Call FairScale and SAID in parallel (fast)
   const regData = REGISTRY.registeredAgents.get(wallet);
   const satiData = REGISTRY.satiByWallet.get(wallet);
-  
-  // Check if we already know a social handle from registration/SATI
   const knownHandle = regData?.twitter || satiData?.twitter || null;
   
-  const [fairscaleInitial, saidData] = await Promise.all([
-    getFairScaleScore(wallet, knownHandle),
-    getSAIDData(wallet)
-  ]);
+  // If SAID data was pre-fetched (e.g. during sync), skip redundant API call
+  let fairscaleData, saidData;
+  if (prefetchedSaidData !== undefined) {
+    saidData = prefetchedSaidData;
+    fairscaleData = await getFairScaleScore(wallet, knownHandle || saidData?.identity?.twitter || saidData?.identity?.x || null);
+  } else {
+    const [fsResult, saidResult] = await Promise.all([
+      getFairScaleScore(wallet, knownHandle),
+      getSAIDData(wallet)
+    ]);
+    fairscaleData = fsResult;
+    saidData = saidResult;
+  }
 
-  // Step 2: If SAID gave us a social handle and FairScale didn't get social data, re-score with handle
-  let fairscaleData = fairscaleInitial;
+  // If SAID provided a handle and FairScale didn't get social, re-try with handle
   const saidHandle = saidData?.identity?.twitter || saidData?.identity?.x || null;
-  if (saidHandle && !knownHandle && fairscaleInitial?.social_score === 0) {
-    if (REGISTRY.agents.size < 5) console.log(`[Score] Re-scoring ${wallet.slice(0,8)} with SAID handle "${saidHandle}"`);
+  if (saidHandle && !knownHandle && fairscaleData?.social_score === 0) {
     const enriched = await getFairScaleScore(wallet, saidHandle);
     if (enriched) fairscaleData = enriched;
   }
@@ -1219,6 +1244,10 @@ async function getOrCreateAgent(wallet) {
 
   const features = calculateAgentFeatures(fairscaleData);
   
+  // Resolve 8004 metadata early (needed for description + name)
+  const erc8004Data = REGISTRY.erc8004ByWallet.get(wallet);
+  const erc8004Tag = erc8004Data ? { assetId: erc8004Data.assetId, name: erc8004Data.name, services: erc8004Data.services || [], skills: erc8004Data.skills || [] } : null;
+
   // Resolve description for quality scoring
   const agentDescription = regData?.description || erc8004Data?.description || satiData?.description || saidData?.identity?.description || null;
   const descQuality = scoreDescriptionQuality(agentDescription);
@@ -1228,10 +1257,6 @@ async function getOrCreateAgent(wallet) {
   const breakdown = scoreResult.breakdown;
   const recommendation = getRecommendationTier(agentFairScore, verifications, wallet);
   const percentiles = computePercentiles(wallet, features, agentFairScore);
-
-  // Restore 8004 metadata if available
-  const erc8004Data = REGISTRY.erc8004ByWallet.get(wallet);
-  const erc8004Tag = erc8004Data ? { assetId: erc8004Data.assetId, name: erc8004Data.name, services: erc8004Data.services || [], skills: erc8004Data.skills || [] } : null;
 
   const agent = {
     wallet,
