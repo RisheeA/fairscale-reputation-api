@@ -432,61 +432,128 @@ async function syncFromSAID() {
 // We query Helius DAS API for all assets from the SATI token group.
 
 async function syncFromSATI() {
-  console.log('[SATI Sync] Starting (Token-2022 NFT discovery via Helius DAS)...');
+  console.log('[SATI Sync] Starting (via sati.cascade.fyi REST API)...');
   try {
-    if (!CONFIG.HELIUS_API_KEY) { console.log('[SATI Sync] No Helius key, skipping'); return; }
-    // Use getAssetsByGroup to find all SATI Token-2022 NFTs
-    let page = 1, allAssets = [];
+    const SATI_API = 'https://sati.cascade.fyi';
+    let imported = 0, failed = 0, offset = 0;
+    const limit = 50;
+    let totalAgents = 0;
+
+    // Paginate through all SATI agents with reputation included
     while (true) {
-      const r = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 'sati', method: 'getAssetsByAuthority', params: { authorityAddress: CONFIG.SATI_PROGRAM, page, limit: 1000 } })
-      });
-      const data = await r.json();
-      const items = data?.result?.items || [];
-      if (items.length === 0) break;
-      allAssets.push(...items);
-      if (items.length < 1000) break;
-      page++;
-    }
-    console.log(`[SATI Sync] Found ${allAssets.length} SATI assets`);
-
-    let imported = 0, failed = 0;
-    for (const asset of allAssets) {
       try {
-        const wallet = asset.ownership?.owner;
-        if (!wallet) { failed++; continue; }
-        const name = asset.content?.metadata?.name || null;
-        const desc = asset.content?.metadata?.description || null;
-        const uri = asset.content?.json_uri || null;
-        const assetId = asset.id;
+        const r = await fetch(`${SATI_API}/api/agents?network=mainnet&limit=${limit}&offset=${offset}&includeReputation=true`, {
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!r.ok) { console.error(`[SATI Sync] HTTP ${r.status} from SATI API`); break; }
+        const data = await r.json();
+        const agents = data.agents || [];
+        totalAgents = data.totalAgents || totalAgents;
 
-        // Fetch metadata from URI if available
-        let meta = null;
-        if (uri) {
+        if (agents.length === 0) break;
+
+        for (const agent of agents) {
           try {
-            const mr = await fetch(uri, { signal: AbortSignal.timeout(5000) });
-            if (mr.ok) meta = await mr.json();
-          } catch(e) {}
+            const wallet = agent.owner;
+            if (!wallet) { failed++; continue; }
+
+            const satiAgent = {
+              assetId: agent.mint,
+              wallet,
+              name: agent.name || null,
+              description: agent.description || null,
+              image: agent.image || null,
+              services: (agent.services || []).map(s => ({
+                name: s.name || 'unknown',
+                endpoint: s.endpoint || '',
+                ...(s.mcpTools ? { mcpTools: s.mcpTools } : {}),
+                ...(s.a2aSkills ? { a2aSkills: s.a2aSkills } : {}),
+              })),
+              skills: [],
+              active: agent.active || false,
+              x402Support: agent.x402Support || false,
+              supportedTrust: agent.supportedTrust || [],
+              memberNumber: agent.memberNumber || null,
+              nonTransferable: agent.nonTransferable || false,
+              uri: agent.uri || null,
+              // Reputation data from SATI
+              reputation: agent.reputation ? {
+                count: agent.reputation.count || 0,
+                summaryValue: agent.reputation.summaryValue || 0,
+                summaryValueDecimals: agent.reputation.summaryValueDecimals || 0,
+              } : null,
+            };
+
+            REGISTRY.satiAgents.set(agent.mint, satiAgent);
+            REGISTRY.satiByWallet.set(wallet, satiAgent);
+            imported++;
+          } catch (e) { failed++; }
         }
 
-        const satiAgent = {
-          assetId, wallet, name: meta?.name || name, description: meta?.description || desc,
-          endpoints: meta?.endpoints || [], services: meta?.services || [],
-          skills: meta?.skills || [], image: meta?.image || asset.content?.links?.image || null,
-          registrationFile: meta, mintedAt: asset.created_at || null,
-        };
-
-        REGISTRY.satiAgents.set(assetId, satiAgent);
-        REGISTRY.satiByWallet.set(wallet, satiAgent);
-        imported++;
-      } catch (e) { failed++; }
-      if (imported % 50 === 0) await new Promise(r => setTimeout(r, 100));
+        console.log(`[SATI Sync] Page ${Math.floor(offset / limit) + 1}: ${agents.length} agents (${imported} total imported)`);
+        offset += limit;
+        if (agents.length < limit) break;
+        await new Promise(r => setTimeout(r, 300)); // Respect rate limits
+      } catch (e) {
+        console.error(`[SATI Sync] Page error:`, e.message);
+        break;
+      }
     }
-    console.log(`[SATI Sync] Done: ${imported} agents, ${failed} failed`);
+
+    console.log(`[SATI Sync] Done: ${imported} agents imported, ${failed} failed, ${totalAgents} total on SATI`);
+
+    // Fetch feedback for SATI agents that have reputation data
+    let feedbackCount = 0;
+    for (const [mint, agent] of REGISTRY.satiAgents) {
+      if (!agent.reputation || agent.reputation.count === 0) continue;
+      try {
+        const fr = await fetch(`${SATI_API}/api/feedback/${mint}?network=mainnet&limit=50`, {
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!fr.ok) continue;
+        const fdata = await fr.json();
+        const feedbacks = fdata.feedbacks || [];
+
+        if (feedbacks.length > 0) {
+          const attesters = feedbacks.map(fb => ({
+            wallet: fb.clientAddress || 'sati_reviewer',
+            score: fb.value || 50,
+            timestamp: fb.createdAt ? new Date(fb.createdAt * 1000).toISOString() : null,
+            type: 'sati_feedback',
+            tag: fb.tag1 || null,
+            outcome: fb.outcome,
+            message: fb.message || null,
+          }));
+
+          // Build attestation graph entry
+          const scored = attesters.filter(a => a.score != null);
+          const weightedSum = scored.reduce((s, a) => s + (a.score * a.score / 100), 0);
+          const totalWeight = scored.reduce((s, a) => s + a.score / 100, 0);
+          const weightedScore = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 0;
+
+          const existing = REGISTRY.attestationGraph.get(agent.wallet);
+          const merged = existing ? [...existing.attesters, ...attesters] : attesters;
+
+          REGISTRY.attestationGraph.set(agent.wallet, {
+            attesters: merged,
+            attester_count: merged.length,
+            scored_attesters: merged.filter(a => a.score != null).length,
+            weighted_score: weightedScore,
+            highest_attester: scored.length > 0 ? Math.max(...scored.map(a => a.score)) : 0,
+            updated_at: new Date().toISOString(),
+          });
+          feedbackCount += feedbacks.length;
+        }
+        await new Promise(r => setTimeout(r, 200));
+      } catch (e) {}
+    }
+
+    console.log(`[SATI Sync] Feedback: ${feedbackCount} entries loaded into attestation graph`);
     REGISTRY.lastSatiSync = new Date().toISOString();
 
-    // After SATI sync, build attestation graph
+    // Build attestation graph for non-SATI agents too
     await buildAttestationGraph();
   } catch (e) { console.error('[SATI Sync] Error:', e.message); }
 }
@@ -1070,13 +1137,17 @@ function calculateVerificationScore(wallet, saidData, verifications) {
 
 // --- SOCIAL & REPUTATION SCORE (15% of composite) ---
 // Uses FairScale social_score, SAID attestations/reputation, SAID social handles
-function calculateSocialScore(fairscaleData, saidData) {
-  const socialRaw = fairscaleData?.social_score || 0;  // 0-100 from FairScale API
+function calculateSocialScore(fairscaleData, saidData, satiData) {
+  const socialRaw = fairscaleData?.social_score || 0;
   const badges = fairscaleData?.badges || [];
   const attestations = saidData?.reputation?.feedbackCount || 0;
   const saidRepScore = saidData?.reputation?.score || 0;
 
-  // Check for SAID social handles (could be twitter, x, github, telegram, etc.)
+  // SATI reputation data
+  const satiRepCount = satiData?.reputation?.count || 0;
+  const satiRepValue = satiData?.reputation?.summaryValue || 0;
+  const satiScore = satiRepCount > 0 ? clamp(satiRepValue, 0, 100) : 0;
+
   const identity = saidData?.identity || {};
   const hasSaidSocials = !!(identity.twitter || identity.x || identity.github || identity.telegram ||
     identity.discord || identity.socials || identity.social);
@@ -1084,9 +1155,23 @@ function calculateSocialScore(fairscaleData, saidData) {
 
   const fsocialScore = clamp(socialRaw, 0, 100);
   const badgeScore = clamp(badges.length * 12, 0, 100);
-  const attestScore = clamp(attestations * 8, 0, 100);
+  const attestScore = clamp((attestations + satiRepCount) * 6, 0, 100); // Combined SAID + SATI attestations
   const saidScore = clamp(saidRepScore, 0, 100);
 
+  // Best case: have SAID + SATI + FairScale social data
+  if (satiScore > 0 && (saidRepScore > 0 || hasSaidSocials)) {
+    return clamp(
+      (fsocialScore * 0.20) + (saidScore * 0.20) + (satiScore * 0.20) +
+      (attestScore * 0.20) + (saidSocialBonus * 0.10) + (badgeScore * 0.10),
+      0, 100
+    );
+  }
+  if (satiScore > 0) {
+    return clamp(
+      (fsocialScore * 0.25) + (satiScore * 0.30) + (attestScore * 0.25) + (badgeScore * 0.20),
+      0, 100
+    );
+  }
   if (saidRepScore > 0 || hasSaidSocials) {
     return clamp(
       (fsocialScore * 0.30) + (saidScore * 0.25) + (attestScore * 0.20) +
@@ -1100,7 +1185,6 @@ function calculateSocialScore(fairscaleData, saidData) {
       0, 100
     );
   }
-  // No social_score AND no SAID reputation — badges only contribute a small amount
   return clamp(
     (attestScore * 0.40) + (badgeScore * 0.60),
     0, 100
@@ -1108,13 +1192,13 @@ function calculateSocialScore(fairscaleData, saidData) {
 }
 
 // Helper: does this agent have REAL social data?
-function hasMeaningfulSocialData(fairscaleData, saidData) {
+function hasMeaningfulSocialData(fairscaleData, saidData, satiData) {
   if (fairscaleData?.social_score > 0) return true;
   if (saidData?.reputation?.score > 0) return true;
   if (saidData?.reputation?.feedbackCount > 0) return true;
+  if (satiData?.reputation?.count > 0) return true;
   const id = saidData?.identity || {};
   if (id.twitter || id.x || id.github || id.telegram || id.discord || id.socials || id.social) return true;
-  // Badges alone do NOT count as social data
   return false;
 }
 
@@ -1301,7 +1385,7 @@ function generateTrustSummary(score, features, breakdown, verifications, red_fla
 // AGENT FAIRSCORE COMPOSITE
 // =============================================================================
 
-function calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications = {}, taskProfile = null, descQuality = 0) {
+function calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications = {}, taskProfile = null, descQuality = 0, satiData = null) {
   // CRITICAL: Use fairscore_base (wallet-only, max ~80 without social) and normalize to 0-100.
   // FairScale's combined `fairscore` includes social_score (20/100 of total).
   // If we use combined as our base AND have a separate social pillar, we double-penalize missing social.
@@ -1316,8 +1400,8 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
     : Math.min(Math.round(fsBase * 1.25), 100);
 
   const verificationScore = calculateVerificationScore(wallet, saidData, verifications);
-  const socialScore = calculateSocialScore(fairscaleData, saidData);
-  const hasSocialData = hasMeaningfulSocialData(fairscaleData, saidData);
+  const socialScore = calculateSocialScore(fairscaleData, saidData, satiData);
+  const hasSocialData = hasMeaningfulSocialData(fairscaleData, saidData, satiData);
 
   // Select weight profile: task-specific or default with dynamic redistribution
   let weights;
@@ -1512,7 +1596,7 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
   const agentDescription = regData?.description || erc8004Data?.description || satiData?.description || saidData?.identity?.description || null;
   const descQuality = scoreDescriptionQuality(agentDescription);
   
-  const scoreResult = calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications, null, descQuality);
+  const scoreResult = calculateAgentFairScore(fairscaleData, features, saidData, wallet, verifications, null, descQuality, satiData);
   const agentFairScore = scoreResult.score;
   const breakdown = scoreResult.breakdown;
   const recommendation = getRecommendationTier(agentFairScore, verifications, wallet);
@@ -1530,7 +1614,11 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
       social_score: Math.round(fairscaleData?.social_score || 0),
       said_score: saidData?.reputation?.score || null,
       said_trust_tier: saidData?.reputation?.trustTier || null,
-      attestations: saidData?.reputation?.feedbackCount || 0,
+      attestations: (saidData?.reputation?.feedbackCount || 0) + (satiData?.reputation?.count || 0),
+      sati_reputation: satiData?.reputation ? {
+        count: satiData.reputation.count,
+        value: satiData.reputation.summaryValue,
+      } : null,
     },
     breakdown,
     percentiles,
