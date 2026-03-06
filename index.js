@@ -2301,12 +2301,29 @@ app.get('/stats', (req, res) => {
     if (REGISTRY.erc8004ByWallet.has(wallet) || REGISTRY.satiByWallet.has(wallet)) onBoth++;
     if (REGISTRY.erc8004ByWallet.has(wallet) && REGISTRY.satiByWallet.has(wallet)) onTriple++;
   }
+  // Debug: check attestation graph wallet overlap with scored agents
+  const attestationWallets = Array.from(REGISTRY.attestationGraph.keys());
+  const attestationInAgents = attestationWallets.filter(w => REGISTRY.agents.has(w));
+  const attestationInSati = attestationWallets.filter(w => REGISTRY.satiByWallet.has(w));
+
   res.json({
     agents: REGISTRY.agents.size, registered: REGISTRY.registeredAgents.size,
     verified: REGISTRY.verifiedWallets.size, services: REGISTRY.services.size,
     erc8004Agents: REGISTRY.erc8004Agents.size, saidAgents: REGISTRY.saidAgents.size,
     satiAgents: REGISTRY.satiAgents.size,
     attestationGraphSize: REGISTRY.attestationGraph.size,
+    attestationDebug: {
+      wallets: attestationWallets.map(w => w.slice(0, 12) + '...'),
+      inScoredAgents: attestationInAgents.length,
+      inSatiByWallet: attestationInSati.length,
+      details: attestationWallets.map(w => ({
+        wallet: w.slice(0, 12) + '...',
+        inAgents: REGISTRY.agents.has(w),
+        inSati: REGISTRY.satiByWallet.has(w),
+        inSaid: REGISTRY.saidAgents.has(w),
+        attesterCount: REGISTRY.attestationGraph.get(w)?.attester_count || 0,
+      })),
+    },
     scoreHistorySize: REGISTRY.scoreHistory.size,
     onBothProtocols: onBoth, onTripleProtocols: onTriple,
     lastErc8004Sync: REGISTRY.lastErc8004Sync, lastSaidSync: REGISTRY.lastSaidSync, lastSatiSync: REGISTRY.lastSatiSync,
