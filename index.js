@@ -743,7 +743,7 @@ async function scanCounterparties(wallet) {
     const r = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 'cp', method: 'getSignaturesForAddress',
-        params: [wallet, { limit: 20 }] }),
+        params: [wallet, { limit: 50 }] }),
       signal: AbortSignal.timeout(8000),
     });
     const sigs = (await r.json())?.result || [];
@@ -942,7 +942,9 @@ async function fetchKamiyoData(wallet, lightweight = false) {
     events = Array.isArray(eventsData) ? eventsData : eventsData?.events || [];
   }
 
-  if ((!reliability || !reliability.ok || (reliability.sampleSize === 0 && !reliability.reliabilityScore)) && events.length === 0) return null;
+  if (!reliability || !reliability.ok) {
+    if (events.length === 0) return null;
+  }
 
   // Build metrics from events if available, or from reliability endpoint
   const qualityScores = events.filter(e => e.qualityScore != null).map(e => e.qualityScore);
@@ -1282,6 +1284,16 @@ function calculateVerificationScore(wallet, saidData, verifications) {
   const satiRepValue = satiData?.reputation?.summaryValue || 0;
   if (satiRepCount > 0) score += Math.min(Math.round(satiRepValue / 10), 10);
   if (satiRepCount >= 5) score += 3; // 5+ SATI feedback = extra trust signal
+
+  // Kamiyo marketplace data (same weight as SATI — proves agent is active in commerce)
+  const onKamiyo = REGISTRY.kamiyoData.has(wallet);
+  const kamiyoMetrics = REGISTRY.kamiyoData.get(wallet)?.metrics;
+  if (onKamiyo) {
+    const kJobs = kamiyoMetrics?.total_jobs || 0;
+    if (kJobs >= 10) score += 8;
+    else if (kJobs >= 1) score += 5;
+    else score += 2; // Kamiyo recognizes the wallet even with 0 events
+  }
 
   // Payment verification ($5 USDC — skin in the game)
   if (REGISTRY.verifiedWallets.has(wallet)) score += 10;
@@ -2593,6 +2605,7 @@ app.get('/v1/dashboard', (req, res) => {
       flagged_count: flagged.length,
       flag_rate: scores.length ? Math.round((flagged.length / scores.length) * 100) : 0,
       attestation_coverage: REGISTRY.attestationGraph.size,
+      kamiyo_agents: REGISTRY.kamiyoData.size,
     },
     score_distribution: distribution,
     recommendation_tiers: tiers,
@@ -2713,7 +2726,7 @@ async function syncKamiyo() {
       // Use 3s timeout for batch — skip quickly if Kamiyo doesn't know this wallet
       const reliability = await getKamiyoReliability(wallet, 3000);
       fetched++;
-      if (reliability && reliability.ok && (reliability.sampleSize > 0 || reliability.reliabilityScore > 0)) {
+      if (reliability && reliability.ok) {
         const data = {
           events: [],
           reliability,
