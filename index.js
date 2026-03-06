@@ -897,7 +897,14 @@ async function getKamiyoReliability(wallet, timeout = 8000) {
       signal: AbortSignal.timeout(timeout),
     });
     if (!r.ok) return null;
-    return await r.json();
+    const data = await r.json();
+    // Log first response to understand shape
+    if (!getKamiyoReliability._logged) {
+      console.log(`[Kamiyo Debug] Reliability response keys: ${JSON.stringify(Object.keys(data))}`);
+      console.log(`[Kamiyo Debug] Full response: ${JSON.stringify(data).slice(0, 500)}`);
+      getKamiyoReliability._logged = true;
+    }
+    return data;
   } catch (e) { return null; }
 }
 
@@ -908,7 +915,15 @@ async function getKamiyoEvents(wallet, sinceMs = 0) {
       signal: AbortSignal.timeout(8000),
     });
     if (!r.ok) return null;
-    return await r.json();
+    const data = await r.json();
+    if (!getKamiyoEvents._logged && data) {
+      const sample = Array.isArray(data) ? data[0] : data?.events?.[0];
+      console.log(`[Kamiyo Debug] Events response type: ${Array.isArray(data) ? 'array' : typeof data}, keys: ${JSON.stringify(Object.keys(data))}`);
+      if (sample) console.log(`[Kamiyo Debug] Event sample keys: ${JSON.stringify(Object.keys(sample))}`);
+      console.log(`[Kamiyo Debug] Events sample: ${JSON.stringify(data).slice(0, 500)}`);
+      getKamiyoEvents._logged = true;
+    }
+    return data;
   } catch (e) { return null; }
 }
 
