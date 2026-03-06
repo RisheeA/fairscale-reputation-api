@@ -942,7 +942,7 @@ async function fetchKamiyoData(wallet, lightweight = false) {
     events = Array.isArray(eventsData) ? eventsData : eventsData?.events || [];
   }
 
-  if (!reliability && events.length === 0) return null;
+  if ((!reliability || !reliability.ok || (reliability.sampleSize === 0 && !reliability.reliabilityScore)) && events.length === 0) return null;
 
   // Build metrics from events if available, or from reliability endpoint
   const qualityScores = events.filter(e => e.qualityScore != null).map(e => e.qualityScore);
@@ -952,13 +952,16 @@ async function fetchKamiyoData(wallet, lightweight = false) {
     events: events.slice(0, 50),
     reliability: reliability || {},
     metrics: {
-      total_jobs: events.length || reliability?.totalJobs || reliability?.total_jobs || 0,
-      avg_quality: qualityScores.length > 0 ? Math.round(qualityScores.reduce((a, b) => a + b, 0) / qualityScores.length * 10) / 10 : (reliability?.avgQuality || reliability?.avg_quality || null),
-      avg_refund: refundPcts.length > 0 ? Math.round(refundPcts.reduce((a, b) => a + b, 0) / refundPcts.length * 10) / 10 : (reliability?.avgRefund || reliability?.avg_refund || null),
+      total_jobs: events.length || reliability?.sampleSize || 0,
+      avg_quality: qualityScores.length > 0 ? Math.round(qualityScores.reduce((a, b) => a + b, 0) / qualityScores.length * 10) / 10 : (reliability?.avgQualityScore || null),
+      avg_refund: refundPcts.length > 0 ? Math.round(refundPcts.reduce((a, b) => a + b, 0) / refundPcts.length * 10) / 10 : (reliability?.avgRefundPct || null),
       max_quality: qualityScores.length > 0 ? Math.max(...qualityScores) : null,
       min_quality: qualityScores.length > 0 ? Math.min(...qualityScores) : null,
-      high_quality_jobs: qualityScores.filter(q => q >= 80).length || reliability?.highQualityJobs || 0,
-      disputed_jobs: refundPcts.filter(r => r > 0).length || reliability?.disputedJobs || 0,
+      high_quality_jobs: qualityScores.filter(q => q >= 80).length,
+      disputed_jobs: refundPcts.filter(r => r > 0).length,
+      dispute_rate: reliability?.disputeRate || 0,
+      success_rate: reliability?.successRate || 0,
+      reliability_score: reliability?.reliabilityScore || 0,
       services: events.length > 0 ? [...new Set(events.map(e => e.serviceId).filter(Boolean))] : (reliability?.services || []),
     },
     lastFetch: Date.now(),
@@ -973,17 +976,17 @@ function calculateKamiyoBoosts(kamiyoData) {
   if (!kamiyoData || !kamiyoData.metrics) return { reliabilityBoost: 0, trackRecordBoost: 0, redFlagPenalty: 0, attestationBoost: 0, flags: [] };
 
   const m = kamiyoData.metrics;
+  if (m.total_jobs === 0 && !m.avg_quality && !m.reliability_score) return { reliabilityBoost: 0, trackRecordBoost: 0, redFlagPenalty: 0, attestationBoost: 0, flags: [] };
+
   const flags = [];
 
-  // RELIABILITY BOOST: avg quality score directly maps to reliability
-  // High quality jobs = reliable agent
+  // RELIABILITY BOOST: use Kamiyo's own reliability score or avg quality
   let reliabilityBoost = 0;
-  if (m.avg_quality != null) {
-    if (m.avg_quality >= 90) reliabilityBoost = 20;
-    else if (m.avg_quality >= 80) reliabilityBoost = 15;
-    else if (m.avg_quality >= 70) reliabilityBoost = 10;
-    else if (m.avg_quality >= 50) reliabilityBoost = 5;
-  }
+  const quality = m.avg_quality || m.reliability_score || 0;
+  if (quality >= 90) reliabilityBoost = 20;
+  else if (quality >= 80) reliabilityBoost = 15;
+  else if (quality >= 70) reliabilityBoost = 10;
+  else if (quality >= 50) reliabilityBoost = 5;
 
   // TRACK RECORD BOOST: job count = proven history
   let trackRecordBoost = 0;
@@ -2710,17 +2713,20 @@ async function syncKamiyo() {
       // Use 3s timeout for batch — skip quickly if Kamiyo doesn't know this wallet
       const reliability = await getKamiyoReliability(wallet, 3000);
       fetched++;
-      if (reliability) {
+      if (reliability && reliability.ok && (reliability.sampleSize > 0 || reliability.reliabilityScore > 0)) {
         const data = {
           events: [],
           reliability,
           metrics: {
-            total_jobs: reliability.totalJobs || reliability.total_jobs || 0,
-            avg_quality: reliability.avgQuality || reliability.avg_quality || null,
-            avg_refund: reliability.avgRefund || reliability.avg_refund || null,
+            total_jobs: reliability.sampleSize || 0,
+            avg_quality: reliability.avgQualityScore || null,
+            avg_refund: reliability.avgRefundPct || null,
             max_quality: null, min_quality: null,
-            high_quality_jobs: reliability.highQualityJobs || 0,
-            disputed_jobs: reliability.disputedJobs || 0,
+            high_quality_jobs: 0,
+            disputed_jobs: 0,
+            dispute_rate: reliability.disputeRate || 0,
+            success_rate: reliability.successRate || 0,
+            reliability_score: reliability.reliabilityScore || 0,
             services: reliability.services || [],
           },
           lastFetch: Date.now(),
