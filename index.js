@@ -1951,7 +1951,7 @@ app.get('/v1/trust-gate', async (req, res) => {
       },
       red_flags: agent.red_flags || [],
       score_trend: agent.score_trend || null,
-      attestation_graph: agent.attestation_graph ? { attester_count: agent.attestation_graph.attester_count, weighted_score: agent.attestation_graph.weighted_score } : null,
+      attestation_graph: (() => { const ag = REGISTRY.attestationGraph.get(agent.wallet) || agent.attestation_graph; return ag ? { attester_count: ag.attester_count, weighted_score: ag.weighted_score } : null; })(),
       meta: { provider: 'FairScale', version: 'v1', scored_at: agent.lastUpdated, cache_ttl: 1800, gate_config: { min_score: minScore, require_verification: requireVerification, require_no_flags: requireNoFlags, task: taskProfile || 'default' } },
     });
   } catch (e) {
@@ -2016,7 +2016,7 @@ app.get('/score', async (req, res) => {
   if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
   const agent = await getOrCreateAgent(wallet);
   if (!agent) return res.status(404).json({ error: 'Could not fetch data', wallet });
-  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: agent.attestation_graph, score_trend: agent.score_trend, counterparties: agent.counterparties, funder: agent.funder, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services });
+  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: REGISTRY.attestationGraph.get(wallet) || agent.attestation_graph || null, score_trend: agent.score_trend, counterparties: agent.counterparties, funder: agent.funder, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services, scores: agent.scores });
 });
 
 // --- Registration ---
@@ -2105,6 +2105,19 @@ app.get('/directory', (req, res) => {
 
   // Recommendation filter
   if (recommendation) agents = agents.filter(a => a.recommendation?.tier === recommendation);
+
+  // Attestation filter — show only agents with attestation data
+  if (req.query.has_attestations === '1') {
+    agents = agents.filter(a => {
+      const ag = REGISTRY.attestationGraph.get(a.wallet) || a.attestation_graph;
+      return ag && ag.attester_count > 0;
+    });
+  }
+
+  // Flagged filter — show only agents with red flags
+  if (req.query.has_flags === '1') {
+    agents = agents.filter(a => a.red_flags && a.red_flags.length > 0);
+  }
 
   // Sort
   const sortFn = {
