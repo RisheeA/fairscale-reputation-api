@@ -447,7 +447,7 @@ async function syncFromSATI() {
       try {
         const r = await fetch(`${SATI_API}/api/agents?network=mainnet&limit=${limit}&offset=${offset}&includeReputation=true`, {
           headers: { accept: 'application/json' },
-          signal: AbortSignal.timeout(15000),
+          signal: AbortSignal.timeout(30000),
         });
         if (!r.ok) { console.error(`[SATI Sync] HTTP ${r.status} from SATI API`); break; }
         const data = await r.json();
@@ -523,10 +523,10 @@ async function syncFromSATI() {
     }
     console.log(`[SATI Sync] Scoring: ${satiScored} scored, ${satiScoreFailed} failed`);
 
-    // Phase 3: Fetch feedback for SATI agents that have reputation data
-    let feedbackCount = 0;
+    // Phase 3: Fetch feedback for ALL SATI agents (don't filter by reputation count — REST API may have data not in summary)
+    let feedbackCount = 0, feedbackChecked = 0;
     for (const [mint, agent] of REGISTRY.satiAgents) {
-      if (!agent.reputation || agent.reputation.count === 0) continue;
+      feedbackChecked++;
       try {
         const fr = await fetch(`${SATI_API}/api/feedback/${mint}?network=mainnet&limit=50`, {
           headers: { accept: 'application/json' },
@@ -547,35 +547,26 @@ async function syncFromSATI() {
             message: fb.message || null,
           }));
 
-          // Build attestation graph entry
-          const scoredAttesters = attesters.filter(a => a.score != null);
-          const weightedSum = scoredAttesters.reduce((s, a) => s + (a.score * a.score / 100), 0);
-          const totalWeight = scoredAttesters.reduce((s, a) => s + a.score / 100, 0);
-          const weightedScore = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 0;
-
           const existing = REGISTRY.attestationGraph.get(agent.wallet);
           const merged = existing ? [...existing.attesters, ...attesters] : attesters;
+          const sa = merged.filter(a => a.score != null);
 
           REGISTRY.attestationGraph.set(agent.wallet, {
             attesters: merged,
             attester_count: merged.length,
-            scored_attesters: merged.filter(a => a.score != null).length,
-            weighted_score: (() => {
-              const sa = merged.filter(a => a.score != null);
-              const ws = sa.reduce((s, a) => s + (a.score * a.score / 100), 0);
-              const tw = sa.reduce((s, a) => s + a.score / 100, 0);
-              return tw > 0 ? Math.round(ws / tw) : 0;
-            })(),
-            highest_attester: merged.filter(a => a.score != null).length > 0 ? Math.max(...merged.filter(a => a.score != null).map(a => a.score)) : 0,
+            scored_attesters: sa.length,
+            weighted_score: sa.length > 0 ? Math.round(sa.reduce((s, a) => s + (a.score * a.score / 100), 0) / sa.reduce((s, a) => s + a.score / 100, 0)) : 0,
+            highest_attester: sa.length > 0 ? Math.max(...sa.map(a => a.score)) : 0,
             updated_at: new Date().toISOString(),
           });
           feedbackCount += feedbacks.length;
+          console.log(`[SATI Feedback] ${agent.name || mint.slice(0,8)}: ${feedbacks.length} feedbacks → ${merged.length} total attesters`);
         }
-        await new Promise(r => setTimeout(r, 200));
+        await new Promise(r => setTimeout(r, 250));
       } catch (e) {}
     }
 
-    console.log(`[SATI Sync] Feedback: ${feedbackCount} entries loaded into attestation graph`);
+    console.log(`[SATI Sync] Feedback: checked ${feedbackChecked} agents, ${feedbackCount} entries loaded into attestation graph`);
 
     REGISTRY.lastSatiSync = new Date().toISOString();
 
@@ -922,35 +913,38 @@ async function getKamiyoEvents(wallet, sinceMs = 0) {
 }
 
 // Fetch and cache Kamiyo data for a wallet
-async function fetchKamiyoData(wallet) {
+// lightweight=true: only fetch reliability endpoint (for batch sync)
+async function fetchKamiyoData(wallet, lightweight = false) {
   const cached = REGISTRY.kamiyoData.get(wallet);
   if (cached && Date.now() - cached.lastFetch < 1800000) return cached; // 30min cache
 
-  const [reliability, eventsData] = await Promise.all([
-    getKamiyoReliability(wallet),
-    getKamiyoEvents(wallet),
-  ]);
-
-  const events = Array.isArray(eventsData) ? eventsData : eventsData?.events || [];
+  // In lightweight mode, only fetch reliability (1 call instead of 2)
+  const reliability = await getKamiyoReliability(wallet);
+  let events = [];
+  
+  if (!lightweight && reliability) {
+    const eventsData = await getKamiyoEvents(wallet);
+    events = Array.isArray(eventsData) ? eventsData : eventsData?.events || [];
+  }
 
   if (!reliability && events.length === 0) return null;
 
-  // Compute aggregate metrics from events
+  // Build metrics from events if available, or from reliability endpoint
   const qualityScores = events.filter(e => e.qualityScore != null).map(e => e.qualityScore);
   const refundPcts = events.filter(e => e.refundPct != null).map(e => e.refundPct);
 
   const data = {
-    events: events.slice(0, 50), // Keep last 50 events
+    events: events.slice(0, 50),
     reliability: reliability || {},
     metrics: {
-      total_jobs: events.length,
-      avg_quality: qualityScores.length > 0 ? Math.round(qualityScores.reduce((a, b) => a + b, 0) / qualityScores.length * 10) / 10 : null,
-      avg_refund: refundPcts.length > 0 ? Math.round(refundPcts.reduce((a, b) => a + b, 0) / refundPcts.length * 10) / 10 : null,
+      total_jobs: events.length || reliability?.totalJobs || reliability?.total_jobs || 0,
+      avg_quality: qualityScores.length > 0 ? Math.round(qualityScores.reduce((a, b) => a + b, 0) / qualityScores.length * 10) / 10 : (reliability?.avgQuality || reliability?.avg_quality || null),
+      avg_refund: refundPcts.length > 0 ? Math.round(refundPcts.reduce((a, b) => a + b, 0) / refundPcts.length * 10) / 10 : (reliability?.avgRefund || reliability?.avg_refund || null),
       max_quality: qualityScores.length > 0 ? Math.max(...qualityScores) : null,
       min_quality: qualityScores.length > 0 ? Math.min(...qualityScores) : null,
-      high_quality_jobs: qualityScores.filter(q => q >= 80).length,
-      disputed_jobs: refundPcts.filter(r => r > 0).length,
-      services: [...new Set(events.map(e => e.serviceId).filter(Boolean))],
+      high_quality_jobs: qualityScores.filter(q => q >= 80).length || reliability?.highQualityJobs || 0,
+      disputed_jobs: refundPcts.filter(r => r > 0).length || reliability?.disputedJobs || 0,
+      services: events.length > 0 ? [...new Set(events.map(e => e.serviceId).filter(Boolean))] : (reliability?.services || []),
     },
     lastFetch: Date.now(),
   };
@@ -2150,7 +2144,22 @@ app.get('/score', async (req, res) => {
   // Fetch Kamiyo data on-demand (cached 30min, only when profile is viewed)
   try { await fetchKamiyoData(wallet); } catch (e) {}
   const liveKamiyo = REGISTRY.kamiyoData.get(wallet);
-  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: REGISTRY.attestationGraph.get(wallet) || agent.attestation_graph || null, score_trend: agent.score_trend, counterparties: agent.counterparties, funder: agent.funder, kamiyo: liveKamiyo ? { metrics: liveKamiyo.metrics, reliability: liveKamiyo.reliability } : agent.kamiyo, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: { ...agent.verifications, kamiyo: !!liveKamiyo }, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services, scores: agent.scores });
+
+  // Apply Kamiyo boosts live if data exists (since scoring happened before Kamiyo fetch)
+  let liveScore = agent.scores.agent_fairscore;
+  let liveFeatures = { ...agent.features };
+  let liveBreakdown = { ...agent.breakdown };
+  let liveRedFlags = [...(agent.red_flags || [])];
+  if (liveKamiyo) {
+    const kb = calculateKamiyoBoosts(liveKamiyo);
+    liveFeatures.reliability = Math.min((liveFeatures.reliability || 0) + kb.reliabilityBoost, 100);
+    liveFeatures.track_record = Math.min((liveFeatures.track_record || 0) + kb.trackRecordBoost, 100);
+    liveScore = Math.min(Math.max(liveScore + kb.attestationBoost + kb.redFlagPenalty + kb.reliabilityBoost + kb.trackRecordBoost, 5), 100);
+    liveRedFlags.push(...kb.flags);
+    liveBreakdown.kamiyo = { reliability_boost: kb.reliabilityBoost, track_record_boost: kb.trackRecordBoost, attestation_boost: kb.attestationBoost, red_flag_penalty: kb.redFlagPenalty, metrics: liveKamiyo.metrics };
+  }
+
+  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: liveScore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: liveFeatures, breakdown: liveBreakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: liveRedFlags, socials: agent.socials, attestation_graph: REGISTRY.attestationGraph.get(wallet) || agent.attestation_graph || null, score_trend: agent.score_trend, counterparties: agent.counterparties, funder: agent.funder, kamiyo: liveKamiyo ? { metrics: liveKamiyo.metrics, reliability: liveKamiyo.reliability } : agent.kamiyo, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: { ...agent.verifications, kamiyo: !!liveKamiyo }, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services, scores: { ...agent.scores, agent_fairscore: liveScore } });
 });
 
 // --- Registration ---
@@ -2664,12 +2673,31 @@ app.get('/beta/users', (req, res) => {
 
 app.listen(CONFIG.PORT, () => {
   console.log(`FairScale Registry v14.0 on port ${CONFIG.PORT}`);
-  console.log(`  Integrations: FairScale API, SAID Protocol, ERC-8004, SATI, SAS, ClawKey`);
+  console.log(`  Integrations: FairScale API, SAID Protocol, ERC-8004, SATI, SAS, ClawKey, Kamiyo`);
   console.log(`  Features: Attestation Graph, Score History, Task Profiles, Trust Gate`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
   setTimeout(syncFromSATI, 30000);
+  setTimeout(syncKamiyo, 60000); // Start Kamiyo after 60s (agents being scored by then)
   setInterval(syncFromSAID, 24 * 60 * 60 * 1000);
   setInterval(syncFrom8004, 6 * 60 * 60 * 1000);
   setInterval(syncFromSATI, 6 * 60 * 60 * 1000);
+  setInterval(syncKamiyo, 3 * 60 * 60 * 1000); // Re-sync Kamiyo every 3h
 });
+
+// Kamiyo batch sync — fetch data for all scored agents
+async function syncKamiyo() {
+  console.log('[Kamiyo Sync] Starting batch fetch for scored agents...');
+  let fetched = 0, withData = 0, errors = 0;
+  const wallets = Array.from(REGISTRY.agents.keys());
+  for (const wallet of wallets) {
+    try {
+      const data = await fetchKamiyoData(wallet, true); // lightweight: reliability only
+      fetched++;
+      if (data && data.metrics && data.metrics.total_jobs > 0) withData++;
+    } catch (e) { errors++; }
+    // Short delay to not hammer Kamiyo API
+    if (fetched % 20 === 0) await new Promise(r => setTimeout(r, 500));
+  }
+  console.log(`[Kamiyo Sync] Done: ${fetched} checked, ${withData} with data, ${errors} errors`);
+}
