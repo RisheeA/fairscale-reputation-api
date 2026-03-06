@@ -503,7 +503,24 @@ async function syncFromSATI() {
 
     console.log(`[SATI Sync] Done: ${imported} agents imported, ${failed} failed, ${totalAgents} total on SATI`);
 
-    // Fetch feedback for SATI agents that have reputation data
+    // Phase 2: Score SATI agents so they appear in the directory
+    let satiScored = 0, satiScoreFailed = 0;
+    for (const [mint, agent] of REGISTRY.satiAgents) {
+      if (REGISTRY.agents.has(agent.wallet)) {
+        // Already scored from SAID/8004 — just make sure sati flag is visible
+        satiScored++;
+        continue;
+      }
+      try {
+        const result = await getOrCreateAgent(agent.wallet, null);
+        if (result) satiScored++;
+        else satiScoreFailed++;
+      } catch (e) { satiScoreFailed++; }
+      await new Promise(r => setTimeout(r, 600));
+    }
+    console.log(`[SATI Sync] Scoring: ${satiScored} scored, ${satiScoreFailed} failed`);
+
+    // Phase 3: Fetch feedback for SATI agents that have reputation data
     let feedbackCount = 0;
     for (const [mint, agent] of REGISTRY.satiAgents) {
       if (!agent.reputation || agent.reputation.count === 0) continue;
@@ -519,7 +536,7 @@ async function syncFromSATI() {
         if (feedbacks.length > 0) {
           const attesters = feedbacks.map(fb => ({
             wallet: fb.clientAddress || 'sati_reviewer',
-            score: fb.value || 50,
+            score: fb.value != null ? fb.value : 50,
             timestamp: fb.createdAt ? new Date(fb.createdAt * 1000).toISOString() : null,
             type: 'sati_feedback',
             tag: fb.tag1 || null,
@@ -528,9 +545,9 @@ async function syncFromSATI() {
           }));
 
           // Build attestation graph entry
-          const scored = attesters.filter(a => a.score != null);
-          const weightedSum = scored.reduce((s, a) => s + (a.score * a.score / 100), 0);
-          const totalWeight = scored.reduce((s, a) => s + a.score / 100, 0);
+          const scoredAttesters = attesters.filter(a => a.score != null);
+          const weightedSum = scoredAttesters.reduce((s, a) => s + (a.score * a.score / 100), 0);
+          const totalWeight = scoredAttesters.reduce((s, a) => s + a.score / 100, 0);
           const weightedScore = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 0;
 
           const existing = REGISTRY.attestationGraph.get(agent.wallet);
@@ -540,8 +557,13 @@ async function syncFromSATI() {
             attesters: merged,
             attester_count: merged.length,
             scored_attesters: merged.filter(a => a.score != null).length,
-            weighted_score: weightedScore,
-            highest_attester: scored.length > 0 ? Math.max(...scored.map(a => a.score)) : 0,
+            weighted_score: (() => {
+              const sa = merged.filter(a => a.score != null);
+              const ws = sa.reduce((s, a) => s + (a.score * a.score / 100), 0);
+              const tw = sa.reduce((s, a) => s + a.score / 100, 0);
+              return tw > 0 ? Math.round(ws / tw) : 0;
+            })(),
+            highest_attester: merged.filter(a => a.score != null).length > 0 ? Math.max(...merged.filter(a => a.score != null).map(a => a.score)) : 0,
             updated_at: new Date().toISOString(),
           });
           feedbackCount += feedbacks.length;
@@ -551,6 +573,20 @@ async function syncFromSATI() {
     }
 
     console.log(`[SATI Sync] Feedback: ${feedbackCount} entries loaded into attestation graph`);
+
+    // Phase 3: Score SATI agents into the main registry so they appear in the directory
+    let scored = 0, scoreFailed = 0;
+    for (const [mint, agent] of REGISTRY.satiAgents) {
+      if (REGISTRY.agents.has(agent.wallet)) { scored++; continue; } // Already scored via SAID/8004
+      try {
+        const result = await getOrCreateAgent(agent.wallet, null);
+        if (result) scored++;
+        else scoreFailed++;
+      } catch (e) { scoreFailed++; }
+      await new Promise(r => setTimeout(r, 600));
+    }
+    console.log(`[SATI Sync] Scoring: ${scored} scored, ${scoreFailed} failed`);
+
     REGISTRY.lastSatiSync = new Date().toISOString();
 
     // Build attestation graph for non-SATI agents too
@@ -1125,6 +1161,13 @@ function calculateVerificationScore(wallet, saidData, verifications) {
   // SAID reputation score (if available, additional bonus)
   const saidRepScore = saidData?.reputation?.score || 0;
   if (saidRepScore > 0) score += Math.min(Math.round(saidRepScore * 8), 10);
+
+  // SATI reputation (if available, additional bonus — same weight as SAID)
+  const satiData = REGISTRY.satiByWallet.get(wallet);
+  const satiRepCount = satiData?.reputation?.count || 0;
+  const satiRepValue = satiData?.reputation?.summaryValue || 0;
+  if (satiRepCount > 0) score += Math.min(Math.round(satiRepValue / 10), 10);
+  if (satiRepCount >= 5) score += 3; // 5+ SATI feedback = extra trust signal
 
   // Payment verification ($5 USDC — skin in the game)
   if (REGISTRY.verifiedWallets.has(wallet)) score += 10;
@@ -1805,7 +1848,9 @@ app.get('/v1/directory', (req, res) => {
 
   if (source === '8004') agents = agents.filter(a => !!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet));
   else if (source === 'said') agents = agents.filter(a => REGISTRY.saidAgents.has(a.wallet));
+  else if (source === 'sati') agents = agents.filter(a => REGISTRY.satiByWallet.has(a.wallet));
   else if (source === 'both') agents = agents.filter(a => (!!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet)) && REGISTRY.saidAgents.has(a.wallet));
+  else if (source === 'fairscale') agents = agents.filter(a => a.isRegistered);
 
   if (search) agents = agents.filter(a => a.wallet.toLowerCase().includes(search) || (a.name || '').toLowerCase().includes(search));
   if (min_score > 0) agents = agents.filter(a => a.scores.agent_fairscore >= min_score);
@@ -2039,6 +2084,7 @@ app.get('/directory', (req, res) => {
   // Source filter
   if (source === '8004') agents = agents.filter(a => !!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet));
   else if (source === 'said') agents = agents.filter(a => REGISTRY.saidAgents.has(a.wallet));
+  else if (source === 'sati') agents = agents.filter(a => REGISTRY.satiByWallet.has(a.wallet));
   else if (source === 'fairscale') agents = agents.filter(a => a.isRegistered);
   else if (source === 'both') agents = agents.filter(a => (!!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet)) && REGISTRY.saidAgents.has(a.wallet));
 
@@ -2088,14 +2134,17 @@ app.get('/directory', (req, res) => {
   const result = paged.map((a, i) => {
     const onSaid = REGISTRY.saidAgents.has(a.wallet);
     const on8004 = !!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet);
+    const onSati = REGISTRY.satiByWallet.has(a.wallet);
     const sources = [];
     if (onSaid) sources.push('said');
     if (on8004) sources.push('erc8004');
+    if (onSati) sources.push('sati');
     if (a.isRegistered) sources.push('fairscale');
 
     const boosts = {};
     if (onSaid) boosts.said_onchain = '+3';
     if (on8004) boosts.erc8004_registry = '+5';
+    if (onSati) boosts.sati_registry = '+5';
     if (onSaid && on8004) boosts.dual_registry = '+3';
     if (a.isRegistered) boosts.fairscale_registered = '+2';
     if (a.isVerified) boosts.payment_verified = '+5';
@@ -2248,7 +2297,7 @@ app.get('/stats', (req, res) => {
     scoreHistorySize: REGISTRY.scoreHistory.size,
     onBothProtocols: onBoth, onTripleProtocols: onTriple,
     lastErc8004Sync: REGISTRY.lastErc8004Sync, lastSaidSync: REGISTRY.lastSaidSync, lastSatiSync: REGISTRY.lastSatiSync,
-    verificationProviders: { clawkey: 'active', said_onchain: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key', erc8004: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key', sati: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key' },
+    verificationProviders: { clawkey: 'active', said_onchain: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key', erc8004: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key', sati: 'active' },
   });
 });
 
