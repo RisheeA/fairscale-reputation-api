@@ -1792,8 +1792,8 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
     features: {
       ...features,
       // Apply Kamiyo boosts to pillars
-      reliability: Math.min((features.reliability || 0) + (kamiyoBoosts.reliabilityBoost || 0), 100),
-      track_record: Math.min((features.track_record || 0) + (kamiyoBoosts.trackRecordBoost || 0), 100),
+      reliability: Math.min((features.reliability || 0) + (breakdown.kamiyo?.reliability_boost || 0), 100),
+      track_record: Math.min((features.track_record || 0) + (breakdown.kamiyo?.track_record_boost || 0), 100),
       verification: breakdown.verification,
       social: breakdown.social,
       desc_quality: descQuality,
