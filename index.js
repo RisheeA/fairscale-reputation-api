@@ -25,6 +25,8 @@ const CONFIG = {
   SATI_PROGRAM: 'satiRkxEiwZ51cv8PRu8UMzuaqeaNU9jABo6oAFMsLe',
   SAS_PROGRAM: 'attsHUrSzCyJqwjddBnTRFStKnPBHPbFTNsm8j22aVr',
   CLAWKEY_API: 'https://clawkey.ai/api',
+  KAMIYO_API: 'https://api.kamiyo.ai/api/fusion/fairscale',
+  KAMIYO_READ_TOKEN: process.env.KAMIYO_READ_TOKEN || 'b05486f1633b8e8528de5778cbade0a53da010c0e0ae3ed2',
   SCORE_HISTORY_MAX: 10,  // Keep last N snapshots per wallet
   BETA_CODES: {
     [process.env.BETA_CODE_ADMIN || 'Ch@os123']: { type: 'unlimited', maxUses: Infinity },
@@ -54,6 +56,7 @@ const REGISTRY = {
   satiByWallet: new Map(),      // wallet → SATI agent data
   attestationGraph: new Map(),  // wallet → { attesters: [{wallet, score, timestamp}], weighted_score }
   scoreHistory: new Map(),      // wallet → [{score, timestamp, breakdown}]
+  kamiyoData: new Map(),        // wallet → { events: [], reliability: {}, lastFetch }
   lastErc8004Sync: null,
   lastSaidSync: null,
   lastSatiSync: null,
@@ -904,6 +907,118 @@ async function discoverFundingWallet(wallet) {
 }
 
 // =============================================================================
+// KAMIYO INTEGRATION
+// =============================================================================
+// Kamiyo provides job quality scores, refund rates, and reliability metrics
+// for agents that have completed work through their platform.
+
+async function getKamiyoReliability(wallet) {
+  try {
+    const r = await fetch(`${CONFIG.KAMIYO_API}/reliability/${wallet}?window_days=90&service_limit=10`, {
+      headers: { 'Authorization': `Bearer ${CONFIG.KAMIYO_READ_TOKEN}`, 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+
+async function getKamiyoEvents(wallet, sinceMs = 0) {
+  try {
+    const r = await fetch(`${CONFIG.KAMIYO_API}/events?wallet=${wallet}&since_ms=${sinceMs}&limit=100`, {
+      headers: { 'Authorization': `Bearer ${CONFIG.KAMIYO_READ_TOKEN}`, 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; }
+}
+
+// Fetch and cache Kamiyo data for a wallet
+async function fetchKamiyoData(wallet) {
+  const cached = REGISTRY.kamiyoData.get(wallet);
+  if (cached && Date.now() - cached.lastFetch < 1800000) return cached; // 30min cache
+
+  const [reliability, eventsData] = await Promise.all([
+    getKamiyoReliability(wallet),
+    getKamiyoEvents(wallet),
+  ]);
+
+  const events = Array.isArray(eventsData) ? eventsData : eventsData?.events || [];
+
+  if (!reliability && events.length === 0) return null;
+
+  // Compute aggregate metrics from events
+  const qualityScores = events.filter(e => e.qualityScore != null).map(e => e.qualityScore);
+  const refundPcts = events.filter(e => e.refundPct != null).map(e => e.refundPct);
+
+  const data = {
+    events: events.slice(0, 50), // Keep last 50 events
+    reliability: reliability || {},
+    metrics: {
+      total_jobs: events.length,
+      avg_quality: qualityScores.length > 0 ? Math.round(qualityScores.reduce((a, b) => a + b, 0) / qualityScores.length * 10) / 10 : null,
+      avg_refund: refundPcts.length > 0 ? Math.round(refundPcts.reduce((a, b) => a + b, 0) / refundPcts.length * 10) / 10 : null,
+      max_quality: qualityScores.length > 0 ? Math.max(...qualityScores) : null,
+      min_quality: qualityScores.length > 0 ? Math.min(...qualityScores) : null,
+      high_quality_jobs: qualityScores.filter(q => q >= 80).length,
+      disputed_jobs: refundPcts.filter(r => r > 0).length,
+      services: [...new Set(events.map(e => e.serviceId).filter(Boolean))],
+    },
+    lastFetch: Date.now(),
+  };
+
+  REGISTRY.kamiyoData.set(wallet, data);
+  return data;
+}
+
+// Calculate Kamiyo contribution to scoring pillars
+function calculateKamiyoBoosts(kamiyoData) {
+  if (!kamiyoData || !kamiyoData.metrics) return { reliability: 0, track_record: 0, red_flag_penalty: 0, attestation_boost: 0, flags: [] };
+
+  const m = kamiyoData.metrics;
+  const flags = [];
+
+  // RELIABILITY BOOST: avg quality score directly maps to reliability
+  // High quality jobs = reliable agent
+  let reliabilityBoost = 0;
+  if (m.avg_quality != null) {
+    if (m.avg_quality >= 90) reliabilityBoost = 20;
+    else if (m.avg_quality >= 80) reliabilityBoost = 15;
+    else if (m.avg_quality >= 70) reliabilityBoost = 10;
+    else if (m.avg_quality >= 50) reliabilityBoost = 5;
+  }
+
+  // TRACK RECORD BOOST: job count = proven history
+  let trackRecordBoost = 0;
+  if (m.total_jobs >= 50) trackRecordBoost = 15;
+  else if (m.total_jobs >= 20) trackRecordBoost = 12;
+  else if (m.total_jobs >= 10) trackRecordBoost = 8;
+  else if (m.total_jobs >= 3) trackRecordBoost = 4;
+  else if (m.total_jobs >= 1) trackRecordBoost = 2;
+
+  // RED FLAG: high refund rate = unreliable/disputed agent
+  let redFlagPenalty = 0;
+  if (m.avg_refund != null) {
+    if (m.avg_refund > 50) { redFlagPenalty = -5; flags.push('kamiyo_high_refund'); }
+    else if (m.avg_refund > 25) { redFlagPenalty = -3; flags.push('kamiyo_moderate_refund'); }
+    else if (m.avg_refund > 10) { redFlagPenalty = -1; flags.push('kamiyo_some_refunds'); }
+  }
+
+  // ATTESTATION BOOST: Kamiyo events ARE attestations — real job completions
+  // Each completed job is a verified interaction, weighted by quality
+  let attestationBoost = 0;
+  if (m.total_jobs > 0) {
+    attestationBoost = 5; // existence boost
+    attestationBoost += Math.min(m.high_quality_jobs * 2, 10); // quality completions
+    attestationBoost += Math.min(m.services.length * 2, 6); // service diversity
+  }
+  attestationBoost = Math.min(attestationBoost, 20);
+
+  return { reliabilityBoost, trackRecordBoost, redFlagPenalty, attestationBoost, flags };
+}
+
+// =============================================================================
 // SCORE HISTORY
 // =============================================================================
 // Track score changes over time for trend analysis
@@ -1511,10 +1626,16 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
 
   // Blend: 20% FairScale base, 80% trust composite + bonuses
   // Trust composite is where verification, reliability, etc. live — it should dominate
-  let blended = (fsBaseNormalized * 0.20) + (trustComposite * 0.80) + attestationBoost + descBoost + multiRegistryBonus;
+  // Kamiyo integration: job quality, track record, and refund flags
+  const kamiyoData = REGISTRY.kamiyoData.get(wallet);
+  const kamiyoBoosts = calculateKamiyoBoosts(kamiyoData);
+
+  let blended = (fsBaseNormalized * 0.20) + (trustComposite * 0.80) + attestationBoost + kamiyoBoosts.attestationBoost + descBoost + multiRegistryBonus;
 
   const { penalty, flags } = detectRedFlags(fairscaleData);
   blended += penalty;
+  blended += kamiyoBoosts.redFlagPenalty;
+  flags.push(...kamiyoBoosts.flags);
 
   // Score trend penalty: sudden drops are suspicious
   const trend = getScoreTrend(wallet);
@@ -1548,6 +1669,13 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
     attestation_data: graphData ? { count: graphData.attester_count, weighted_score: graphData.weighted_score, highest: graphData.highest_attester } : null,
     desc_quality: descQuality,
     desc_boost: descBoost,
+    kamiyo: kamiyoData ? {
+      reliability_boost: kamiyoBoosts.reliabilityBoost,
+      track_record_boost: kamiyoBoosts.trackRecordBoost,
+      attestation_boost: kamiyoBoosts.attestationBoost,
+      red_flag_penalty: kamiyoBoosts.redFlagPenalty,
+      metrics: kamiyoData.metrics,
+    } : null,
     multi_registry_bonus: multiRegistryBonus,
     red_flag_penalty: penalty,
     red_flags: flags,
@@ -1597,6 +1725,9 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
   const satiData = REGISTRY.satiByWallet.get(wallet);
   const knownHandle = regData?.twitter || satiData?.twitter || null;
   
+  // Fetch Kamiyo data (cached for 30min, fast if cached)
+  try { await fetchKamiyoData(wallet); } catch (e) {}
+
   // If SAID data was pre-fetched (e.g. during sync), skip redundant API call
   let fairscaleData, saidData;
   if (prefetchedSaidData !== undefined) {
@@ -1676,6 +1807,9 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
     recommendation,
     features: {
       ...features,
+      // Apply Kamiyo boosts to pillars
+      reliability: Math.min((features.reliability || 0) + (kamiyoBoosts.reliabilityBoost || 0), 100),
+      track_record: Math.min((features.track_record || 0) + (kamiyoBoosts.trackRecordBoost || 0), 100),
       verification: breakdown.verification,
       social: breakdown.social,
       desc_quality: descQuality,
@@ -1685,6 +1819,7 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
       said_onchain: REGISTRY.saidAgents.has(wallet),
       erc8004: REGISTRY.erc8004ByWallet.has(wallet),
       sati: REGISTRY.satiByWallet.has(wallet),
+      kamiyo: REGISTRY.kamiyoData.has(wallet),
     },
     erc8004: erc8004Tag,
     sati: REGISTRY.satiByWallet.has(wallet) ? {
@@ -1692,6 +1827,10 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
       name: REGISTRY.satiByWallet.get(wallet).name,
       services: REGISTRY.satiByWallet.get(wallet).services || [],
       skills: REGISTRY.satiByWallet.get(wallet).skills || [],
+    } : null,
+    kamiyo: REGISTRY.kamiyoData.has(wallet) ? {
+      metrics: REGISTRY.kamiyoData.get(wallet).metrics,
+      reliability: REGISTRY.kamiyoData.get(wallet).reliability,
     } : null,
     attestation_graph: REGISTRY.attestationGraph.get(wallet) || null,
     score_trend: getScoreTrend(wallet),
@@ -2024,7 +2163,7 @@ app.get('/score', async (req, res) => {
   if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
   const agent = await getOrCreateAgent(wallet);
   if (!agent) return res.status(404).json({ error: 'Could not fetch data', wallet });
-  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: REGISTRY.attestationGraph.get(wallet) || agent.attestation_graph || null, score_trend: agent.score_trend, counterparties: agent.counterparties, funder: agent.funder, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services, scores: agent.scores });
+  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: REGISTRY.attestationGraph.get(wallet) || agent.attestation_graph || null, score_trend: agent.score_trend, counterparties: agent.counterparties, funder: agent.funder, kamiyo: agent.kamiyo, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services, scores: agent.scores });
 });
 
 // --- Registration ---
@@ -2093,6 +2232,7 @@ app.get('/directory', (req, res) => {
   if (source === '8004') agents = agents.filter(a => !!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet));
   else if (source === 'said') agents = agents.filter(a => REGISTRY.saidAgents.has(a.wallet));
   else if (source === 'sati') agents = agents.filter(a => REGISTRY.satiByWallet.has(a.wallet));
+  else if (source === 'kamiyo') agents = agents.filter(a => REGISTRY.kamiyoData.has(a.wallet));
   else if (source === 'fairscale') agents = agents.filter(a => a.isRegistered);
   else if (source === 'both') agents = agents.filter(a => (!!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet)) && REGISTRY.saidAgents.has(a.wallet));
 
@@ -2156,16 +2296,19 @@ app.get('/directory', (req, res) => {
     const onSaid = REGISTRY.saidAgents.has(a.wallet);
     const on8004 = !!a.erc8004 || REGISTRY.erc8004ByWallet.has(a.wallet);
     const onSati = REGISTRY.satiByWallet.has(a.wallet);
+    const onKamiyo = REGISTRY.kamiyoData.has(a.wallet);
     const sources = [];
     if (onSaid) sources.push('said');
     if (on8004) sources.push('erc8004');
     if (onSati) sources.push('sati');
+    if (onKamiyo) sources.push('kamiyo');
     if (a.isRegistered) sources.push('fairscale');
 
     const boosts = {};
     if (onSaid) boosts.said_onchain = '+3';
     if (on8004) boosts.erc8004_registry = '+5';
     if (onSati) boosts.sati_registry = '+5';
+    if (onKamiyo) boosts.kamiyo_performance = '+' + (REGISTRY.kamiyoData.get(a.wallet)?.metrics?.total_jobs > 0 ? '5-20' : '0');
     if (onSaid && on8004) boosts.dual_registry = '+3';
     if (a.isRegistered) boosts.fairscale_registered = '+2';
     if (a.isVerified) boosts.payment_verified = '+5';
@@ -2314,6 +2457,7 @@ app.get('/stats', (req, res) => {
     verified: REGISTRY.verifiedWallets.size, services: REGISTRY.services.size,
     erc8004Agents: REGISTRY.erc8004Agents.size, saidAgents: REGISTRY.saidAgents.size,
     satiAgents: REGISTRY.satiAgents.size,
+    kamiyoAgents: REGISTRY.kamiyoData.size,
     attestationGraphSize: REGISTRY.attestationGraph.size,
     scoreHistorySize: REGISTRY.scoreHistory.size,
     onBothProtocols: onBoth, onTripleProtocols: onTriple,
