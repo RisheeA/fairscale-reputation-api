@@ -1724,9 +1724,6 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
   const regData = REGISTRY.registeredAgents.get(wallet);
   const satiData = REGISTRY.satiByWallet.get(wallet);
   const knownHandle = regData?.twitter || satiData?.twitter || null;
-  
-  // Fetch Kamiyo data (cached for 30min, fast if cached)
-  try { await fetchKamiyoData(wallet); } catch (e) {}
 
   // If SAID data was pre-fetched (e.g. during sync), skip redundant API call
   let fairscaleData, saidData;
@@ -2163,7 +2160,10 @@ app.get('/score', async (req, res) => {
   if (!wallet) return res.status(400).json({ error: 'Missing wallet' });
   const agent = await getOrCreateAgent(wallet);
   if (!agent) return res.status(404).json({ error: 'Could not fetch data', wallet });
-  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: REGISTRY.attestationGraph.get(wallet) || agent.attestation_graph || null, score_trend: agent.score_trend, counterparties: agent.counterparties, funder: agent.funder, kamiyo: agent.kamiyo, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: agent.verifications, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services, scores: agent.scores });
+  // Fetch Kamiyo data on-demand (cached 30min, only when profile is viewed)
+  try { await fetchKamiyoData(wallet); } catch (e) {}
+  const liveKamiyo = REGISTRY.kamiyoData.get(wallet);
+  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: REGISTRY.attestationGraph.get(wallet) || agent.attestation_graph || null, score_trend: agent.score_trend, counterparties: agent.counterparties, funder: agent.funder, kamiyo: liveKamiyo ? { metrics: liveKamiyo.metrics, reliability: liveKamiyo.reliability } : agent.kamiyo, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: { ...agent.verifications, kamiyo: !!liveKamiyo }, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services, scores: agent.scores });
 });
 
 // --- Registration ---
