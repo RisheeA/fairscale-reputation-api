@@ -36,6 +36,131 @@ const CONFIG = {
 };
 
 // =============================================================================
+// x402 MICROPAYMENT SYSTEM
+// =============================================================================
+// Pay-per-call API access via USDC on Solana.
+// Free tier: 50 calls/day per IP. After that, x402 Payment Required.
+// Agents include X-Payment-Tx header with a USDC transfer signature.
+
+const X402 = {
+  // Pricing per endpoint (USDC)
+  PRICES: {
+    '/v1/score': 0.005,
+    '/score': 0.005,
+    '/v1/trust-gate': 0.002,
+    '/v1/batch': 0.003,        // per wallet in batch
+    '/v1/attestation-graph': 0.002,
+  },
+  FREE_TIER_DAILY: 50,        // Free calls per IP per day
+  usage: new Map(),            // ip -> { count, date }
+  verifiedTxs: new Set(),      // Prevent tx reuse
+  revenue: [],                 // { timestamp, tx, amount, endpoint, caller }
+  totalRevenue: 0,
+};
+
+// Track usage per IP, return whether free tier is exhausted
+function checkFreeTier(ip) {
+  const today = new Date().toISOString().slice(0, 10);
+  const usage = X402.usage.get(ip);
+  if (!usage || usage.date !== today) {
+    X402.usage.set(ip, { count: 1, date: today });
+    return true; // Within free tier
+  }
+  usage.count++;
+  return usage.count <= X402.FREE_TIER_DAILY;
+}
+
+// Verify a USDC payment transaction via Helius
+async function verifyX402Payment(txSignature, expectedAmount) {
+  if (!CONFIG.HELIUS_API_KEY || !txSignature) return { valid: false, error: 'Missing payment' };
+  if (X402.verifiedTxs.has(txSignature)) return { valid: false, error: 'Transaction already used' };
+
+  try {
+    const r = await fetch(`${CONFIG.HELIUS_RPC}/?api-key=${CONFIG.HELIUS_API_KEY}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'x402', method: 'getTransaction',
+        params: [txSignature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }] }),
+      signal: AbortSignal.timeout(10000),
+    });
+    const tx = (await r.json())?.result;
+    if (!tx?.meta || tx.meta.err) return { valid: false, error: 'Transaction failed or not found' };
+
+    // Check USDC transfer to our payment address
+    for (const post of (tx.meta.postTokenBalances || [])) {
+      if (post.mint !== CONFIG.USDC_MINT || post.owner !== CONFIG.PAYMENT_ADDRESS) continue;
+      const pre = (tx.meta.preTokenBalances || []).find(p => p.accountIndex === post.accountIndex);
+      const preAmt = pre ? parseFloat(pre.uiTokenAmount?.uiAmount || 0) : 0;
+      const postAmt = parseFloat(post.uiTokenAmount?.uiAmount || 0);
+      const received = postAmt - preAmt;
+      if (received >= expectedAmount) {
+        // Extract sender wallet
+        const keys = tx.transaction?.message?.accountKeys || [];
+        const sender = keys.find(k => (typeof k === 'object' ? k.signer : false))?.pubkey || keys[0]?.pubkey || keys[0] || 'unknown';
+
+        X402.verifiedTxs.add(txSignature);
+        X402.revenue.push({ timestamp: new Date().toISOString(), tx: txSignature, amount: received, sender });
+        X402.totalRevenue += received;
+        return { valid: true, sender, amount: received };
+      }
+    }
+    return { valid: false, error: `Insufficient payment. Expected ${expectedAmount} USDC, check transfer amount.` };
+  } catch (e) { return { valid: false, error: e.message }; }
+}
+
+// x402 middleware — checks free tier, then requires payment
+function x402Middleware(req, res, next) {
+  const endpoint = req.path;
+  const price = X402.PRICES[endpoint];
+
+  // Not a paid endpoint — pass through
+  if (!price) return next();
+
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+
+  // Check free tier
+  if (checkFreeTier(ip)) return next();
+
+  // Free tier exhausted — check for payment
+  const paymentTx = req.headers['x-payment-tx'] || req.headers['x-402-payment'];
+
+  if (!paymentTx) {
+    return res.status(402).json({
+      error: 'payment_required',
+      message: `Free tier exhausted (${X402.FREE_TIER_DAILY} calls/day). Include USDC payment to continue.`,
+      payment: {
+        protocol: 'x402',
+        network: 'solana',
+        token: 'USDC',
+        amount: price,
+        recipient: CONFIG.PAYMENT_ADDRESS,
+        instructions: `Send ${price} USDC to ${CONFIG.PAYMENT_ADDRESS} on Solana mainnet. Include the transaction signature in the X-Payment-Tx header.`,
+      },
+      pricing: X402.PRICES,
+      free_tier: { limit: X402.FREE_TIER_DAILY, period: 'day', usage: X402.usage.get(ip)?.count || 0 },
+    });
+  }
+
+  // Verify payment
+  verifyX402Payment(paymentTx, price).then(result => {
+    if (!result.valid) {
+      return res.status(402).json({
+        error: 'payment_invalid',
+        message: result.error,
+        payment: { protocol: 'x402', amount: price, recipient: CONFIG.PAYMENT_ADDRESS },
+      });
+    }
+    // Payment verified — proceed
+    req.x402 = { paid: true, tx: paymentTx, sender: result.sender, amount: result.amount };
+    next();
+  }).catch(() => {
+    res.status(500).json({ error: 'Payment verification failed' });
+  });
+}
+
+// Apply x402 middleware to paid endpoints
+app.use(x402Middleware);
+
+// =============================================================================
 // IN-MEMORY REGISTRY
 // =============================================================================
 
@@ -2489,6 +2614,57 @@ app.get('/stats', (req, res) => {
     onBothProtocols: onBoth, onTripleProtocols: onTriple,
     lastErc8004Sync: REGISTRY.lastErc8004Sync, lastSaidSync: REGISTRY.lastSaidSync, lastSatiSync: REGISTRY.lastSatiSync,
     verificationProviders: { clawkey: 'active', said_onchain: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key', erc8004: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key', sati: 'active' },
+  });
+});
+
+// --- x402 Pricing & Revenue ---
+app.get('/v1/pricing', (req, res) => {
+  res.json({
+    protocol: 'x402',
+    network: 'solana',
+    token: 'USDC',
+    payment_address: CONFIG.PAYMENT_ADDRESS,
+    free_tier: { calls_per_day: X402.FREE_TIER_DAILY, no_payment_required: true },
+    endpoints: Object.entries(X402.PRICES).map(([path, price]) => ({ path, price_usdc: price })),
+    instructions: [
+      '1. Make a standard USDC transfer on Solana mainnet to the payment address',
+      '2. Include the transaction signature in the X-Payment-Tx header',
+      '3. Call any paid endpoint — we verify the payment on-chain and return data',
+      'Note: Each transaction signature can only be used once.',
+    ],
+    example: {
+      curl: `curl -H "X-Payment-Tx: <your_tx_signature>" "${req.protocol}://${req.get('host')}/v1/score?wallet=<wallet>"`,
+    },
+  });
+});
+
+app.get('/v1/revenue', (req, res) => {
+  const key = req.query.key;
+  if (key !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  res.json({
+    total_revenue_usdc: Math.round(X402.totalRevenue * 1000) / 1000,
+    total_paid_calls: X402.revenue.length,
+    verified_txs: X402.verifiedTxs.size,
+    active_ips_today: Array.from(X402.usage.values()).filter(u => u.date === new Date().toISOString().slice(0, 10)).length,
+    free_tier_limit: X402.FREE_TIER_DAILY,
+    recent_payments: X402.revenue.slice(-20).reverse(),
+    pricing: X402.PRICES,
+  });
+});
+
+app.get('/v1/usage', (req, res) => {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+  const today = new Date().toISOString().slice(0, 10);
+  const usage = X402.usage.get(ip);
+  const count = (usage && usage.date === today) ? usage.count : 0;
+  res.json({
+    ip_hash: ip.slice(0, 8) + '...',
+    date: today,
+    calls_used: count,
+    free_remaining: Math.max(X402.FREE_TIER_DAILY - count, 0),
+    free_tier_limit: X402.FREE_TIER_DAILY,
+    payment_required: count >= X402.FREE_TIER_DAILY,
+    pricing: X402.PRICES,
   });
 });
 
