@@ -577,19 +577,6 @@ async function syncFromSATI() {
 
     console.log(`[SATI Sync] Feedback: ${feedbackCount} entries loaded into attestation graph`);
 
-    // Phase 3: Score SATI agents into the main registry so they appear in the directory
-    let scored = 0, scoreFailed = 0;
-    for (const [mint, agent] of REGISTRY.satiAgents) {
-      if (REGISTRY.agents.has(agent.wallet)) { scored++; continue; } // Already scored via SAID/8004
-      try {
-        const result = await getOrCreateAgent(agent.wallet, null);
-        if (result) scored++;
-        else scoreFailed++;
-      } catch (e) { scoreFailed++; }
-      await new Promise(r => setTimeout(r, 600));
-    }
-    console.log(`[SATI Sync] Scoring: ${scored} scored, ${scoreFailed} failed`);
-
     REGISTRY.lastSatiSync = new Date().toISOString();
 
     // Build attestation graph for non-SATI agents too
