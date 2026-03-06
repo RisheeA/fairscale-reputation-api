@@ -978,43 +978,35 @@ function calculateKamiyoBoosts(kamiyoData) {
   if (!kamiyoData || !kamiyoData.metrics) return { reliabilityBoost: 0, trackRecordBoost: 0, redFlagPenalty: 0, attestationBoost: 0, flags: [] };
 
   const m = kamiyoData.metrics;
-  if (m.total_jobs === 0 && !m.avg_quality && !m.reliability_score) return { reliabilityBoost: 0, trackRecordBoost: 0, redFlagPenalty: 0, attestationBoost: 0, flags: [] };
+  // No boosts for wallets with 0 completed jobs — recognition only
+  if (!m.total_jobs || m.total_jobs === 0) return { reliabilityBoost: 0, trackRecordBoost: 0, redFlagPenalty: 0, attestationBoost: 0, flags: [] };
 
   const flags = [];
 
-  // RELIABILITY BOOST: use Kamiyo's own reliability score or avg quality
+  // RELIABILITY BOOST: only from actual quality data (capped modestly)
   let reliabilityBoost = 0;
-  const quality = m.avg_quality || m.reliability_score || 0;
-  if (quality >= 90) reliabilityBoost = 20;
-  else if (quality >= 80) reliabilityBoost = 15;
-  else if (quality >= 70) reliabilityBoost = 10;
-  else if (quality >= 50) reliabilityBoost = 5;
+  const quality = m.avg_quality || 0;
+  if (quality >= 90) reliabilityBoost = 8;
+  else if (quality >= 80) reliabilityBoost = 5;
+  else if (quality >= 60) reliabilityBoost = 3;
 
-  // TRACK RECORD BOOST: job count = proven history
+  // TRACK RECORD BOOST: job count (modest — these are early days)
   let trackRecordBoost = 0;
-  if (m.total_jobs >= 50) trackRecordBoost = 15;
-  else if (m.total_jobs >= 20) trackRecordBoost = 12;
-  else if (m.total_jobs >= 10) trackRecordBoost = 8;
-  else if (m.total_jobs >= 3) trackRecordBoost = 4;
-  else if (m.total_jobs >= 1) trackRecordBoost = 2;
+  if (m.total_jobs >= 50) trackRecordBoost = 6;
+  else if (m.total_jobs >= 20) trackRecordBoost = 4;
+  else if (m.total_jobs >= 5) trackRecordBoost = 2;
+  else if (m.total_jobs >= 1) trackRecordBoost = 1;
 
-  // RED FLAG: high refund rate = unreliable/disputed agent
+  // RED FLAG: high refund rate
   let redFlagPenalty = 0;
-  if (m.avg_refund != null) {
+  if (m.avg_refund != null && m.avg_refund > 0) {
     if (m.avg_refund > 50) { redFlagPenalty = -5; flags.push('kamiyo_high_refund'); }
     else if (m.avg_refund > 25) { redFlagPenalty = -3; flags.push('kamiyo_moderate_refund'); }
     else if (m.avg_refund > 10) { redFlagPenalty = -1; flags.push('kamiyo_some_refunds'); }
   }
 
-  // ATTESTATION BOOST: Kamiyo events ARE attestations — real job completions
-  // Each completed job is a verified interaction, weighted by quality
-  let attestationBoost = 0;
-  if (m.total_jobs > 0) {
-    attestationBoost = 5; // existence boost
-    attestationBoost += Math.min(m.high_quality_jobs * 2, 10); // quality completions
-    attestationBoost += Math.min(m.services.length * 2, 6); // service diversity
-  }
-  attestationBoost = Math.min(attestationBoost, 20);
+  // ATTESTATION BOOST: modest — only from real completed jobs
+  let attestationBoost = Math.min(m.total_jobs, 5);
 
   return { reliabilityBoost, trackRecordBoost, redFlagPenalty, attestationBoost, flags };
 }
@@ -1285,14 +1277,12 @@ function calculateVerificationScore(wallet, saidData, verifications) {
   if (satiRepCount > 0) score += Math.min(Math.round(satiRepValue / 10), 10);
   if (satiRepCount >= 5) score += 3; // 5+ SATI feedback = extra trust signal
 
-  // Kamiyo marketplace data (same weight as SATI — proves agent is active in commerce)
+  // Kamiyo marketplace data (only scores when agent has completed real jobs)
   const onKamiyo = REGISTRY.kamiyoData.has(wallet);
   const kamiyoMetrics = REGISTRY.kamiyoData.get(wallet)?.metrics;
-  if (onKamiyo) {
-    const kJobs = kamiyoMetrics?.total_jobs || 0;
-    if (kJobs >= 10) score += 8;
-    else if (kJobs >= 1) score += 5;
-    else score += 2; // Kamiyo recognizes the wallet even with 0 events
+  if (onKamiyo && kamiyoMetrics?.total_jobs > 0) {
+    if (kamiyoMetrics.total_jobs >= 10) score += 5;
+    else if (kamiyoMetrics.total_jobs >= 1) score += 2;
   }
 
   // Payment verification ($5 USDC — skin in the game)
@@ -2175,21 +2165,7 @@ app.get('/score', async (req, res) => {
   try { await fetchKamiyoData(wallet); } catch (e) {}
   const liveKamiyo = REGISTRY.kamiyoData.get(wallet);
 
-  // Apply Kamiyo boosts live if data exists (since scoring happened before Kamiyo fetch)
-  let liveScore = agent.scores.agent_fairscore;
-  let liveFeatures = { ...agent.features };
-  let liveBreakdown = { ...agent.breakdown };
-  let liveRedFlags = [...(agent.red_flags || [])];
-  if (liveKamiyo) {
-    const kb = calculateKamiyoBoosts(liveKamiyo);
-    liveFeatures.reliability = Math.min((liveFeatures.reliability || 0) + kb.reliabilityBoost, 100);
-    liveFeatures.track_record = Math.min((liveFeatures.track_record || 0) + kb.trackRecordBoost, 100);
-    liveScore = Math.min(Math.max(liveScore + kb.attestationBoost + kb.redFlagPenalty + kb.reliabilityBoost + kb.trackRecordBoost, 5), 100);
-    liveRedFlags.push(...kb.flags);
-    liveBreakdown.kamiyo = { reliability_boost: kb.reliabilityBoost, track_record_boost: kb.trackRecordBoost, attestation_boost: kb.attestationBoost, red_flag_penalty: kb.redFlagPenalty, metrics: liveKamiyo.metrics };
-  }
-
-  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: liveScore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: liveFeatures, breakdown: liveBreakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: liveRedFlags, socials: agent.socials, attestation_graph: REGISTRY.attestationGraph.get(wallet) || agent.attestation_graph || null, score_trend: agent.score_trend, counterparties: agent.counterparties, funder: agent.funder, kamiyo: liveKamiyo ? { metrics: liveKamiyo.metrics, reliability: liveKamiyo.reliability } : agent.kamiyo, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: { ...agent.verifications, kamiyo: !!liveKamiyo }, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services, scores: { ...agent.scores, agent_fairscore: liveScore } });
+  res.json({ wallet, name: agent.name || `Agent ${wallet.slice(0, 8)}...`, description: agent.description, website: agent.website, mcp: agent.mcp, agent_fairscore: agent.scores.agent_fairscore, fairscore_base: agent.scores.fairscore_base, social_score: agent.scores.social_score, trust_summary: agent.trust_summary, recommendation: agent.recommendation, features: agent.features, breakdown: agent.breakdown, percentiles: agent.percentiles, badges: agent.badges, red_flags: agent.red_flags, socials: agent.socials, attestation_graph: REGISTRY.attestationGraph.get(wallet) || agent.attestation_graph || null, score_trend: agent.score_trend, counterparties: agent.counterparties, funder: agent.funder, kamiyo: liveKamiyo ? { metrics: liveKamiyo.metrics, reliability: liveKamiyo.reliability } : agent.kamiyo, descriptions: agent.descriptions, said: { score: agent.scores.said_score, trustTier: agent.scores.said_trust_tier, feedbackCount: agent.scores.attestations }, verifications: { ...agent.verifications, kamiyo: !!liveKamiyo }, isRegistered: agent.isRegistered, isSaidAgent: agent.isSaidAgent, isVerified: agent.isVerified, services: agent.services, scores: agent.scores });
 });
 
 // --- Registration ---
