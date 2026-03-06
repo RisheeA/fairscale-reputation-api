@@ -1473,18 +1473,26 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
     (features.ecosystem * weights.ecosystem)
   );
 
-  // Attestation graph boost (up to +15 points)
-  // High-quality attestations from trusted agents are worth significantly more
+  // Attestation graph boost (up to +25 points)
+  // Attestations are RARE and extremely valuable — an agent with real peer feedback
+  // from verified reviewers is significantly more trustworthy than one without.
   const graphData = REGISTRY.attestationGraph.get(wallet);
   let attestationBoost = 0;
   if (graphData) {
     const count = graphData.attester_count || 0;
     const wScore = graphData.weighted_score || 0;
     const highAttester = graphData.highest_attester || 0;
-    attestationBoost = Math.min(
-      Math.round((count * 2) + (wScore * 0.08) + (highAttester > 70 ? 3 : 0)),
-      15
-    );
+
+    // Base: each attester is worth significant points (diminishing returns)
+    const countBoost = Math.min(count, 10) * 3 + Math.max(count - 10, 0) * 1;
+    // Weighted score quality multiplier (0-100 scale → 0-8 bonus)
+    const qualityBoost = Math.round(wScore * 0.08);
+    // High-trust attester bonus
+    const highTrustBoost = highAttester >= 80 ? 5 : highAttester >= 60 ? 3 : highAttester >= 40 ? 1 : 0;
+    // Having ANY attestation at all is a trust signal (most agents have 0)
+    const existenceBoost = count > 0 ? 5 : 0;
+
+    attestationBoost = Math.min(countBoost + qualityBoost + highTrustBoost + existenceBoost, 25);
   }
 
   // Description quality boost (up to +5 points)
@@ -2301,29 +2309,12 @@ app.get('/stats', (req, res) => {
     if (REGISTRY.erc8004ByWallet.has(wallet) || REGISTRY.satiByWallet.has(wallet)) onBoth++;
     if (REGISTRY.erc8004ByWallet.has(wallet) && REGISTRY.satiByWallet.has(wallet)) onTriple++;
   }
-  // Debug: check attestation graph wallet overlap with scored agents
-  const attestationWallets = Array.from(REGISTRY.attestationGraph.keys());
-  const attestationInAgents = attestationWallets.filter(w => REGISTRY.agents.has(w));
-  const attestationInSati = attestationWallets.filter(w => REGISTRY.satiByWallet.has(w));
-
   res.json({
     agents: REGISTRY.agents.size, registered: REGISTRY.registeredAgents.size,
     verified: REGISTRY.verifiedWallets.size, services: REGISTRY.services.size,
     erc8004Agents: REGISTRY.erc8004Agents.size, saidAgents: REGISTRY.saidAgents.size,
     satiAgents: REGISTRY.satiAgents.size,
     attestationGraphSize: REGISTRY.attestationGraph.size,
-    attestationDebug: {
-      wallets: attestationWallets.map(w => w.slice(0, 12) + '...'),
-      inScoredAgents: attestationInAgents.length,
-      inSatiByWallet: attestationInSati.length,
-      details: attestationWallets.map(w => ({
-        wallet: w.slice(0, 12) + '...',
-        inAgents: REGISTRY.agents.has(w),
-        inSati: REGISTRY.satiByWallet.has(w),
-        inSaid: REGISTRY.saidAgents.has(w),
-        attesterCount: REGISTRY.attestationGraph.get(w)?.attester_count || 0,
-      })),
-    },
     scoreHistorySize: REGISTRY.scoreHistory.size,
     onBothProtocols: onBoth, onTripleProtocols: onTriple,
     lastErc8004Sync: REGISTRY.lastErc8004Sync, lastSaidSync: REGISTRY.lastSaidSync, lastSatiSync: REGISTRY.lastSatiSync,
