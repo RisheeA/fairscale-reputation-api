@@ -974,7 +974,7 @@ async function fetchKamiyoData(wallet) {
 
 // Calculate Kamiyo contribution to scoring pillars
 function calculateKamiyoBoosts(kamiyoData) {
-  if (!kamiyoData || !kamiyoData.metrics) return { reliability: 0, track_record: 0, red_flag_penalty: 0, attestation_boost: 0, flags: [] };
+  if (!kamiyoData || !kamiyoData.metrics) return { reliabilityBoost: 0, trackRecordBoost: 0, redFlagPenalty: 0, attestationBoost: 0, flags: [] };
 
   const m = kamiyoData.metrics;
   const flags = [];
