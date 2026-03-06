@@ -890,11 +890,11 @@ async function discoverFundingWallet(wallet) {
 // Kamiyo provides job quality scores, refund rates, and reliability metrics
 // for agents that have completed work through their platform.
 
-async function getKamiyoReliability(wallet) {
+async function getKamiyoReliability(wallet, timeout = 8000) {
   try {
     const r = await fetch(`${CONFIG.KAMIYO_API}/reliability/${wallet}?window_days=90&service_limit=10`, {
       headers: { 'Authorization': `Bearer ${CONFIG.KAMIYO_READ_TOKEN}`, 'Accept': 'application/json' },
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(timeout),
     });
     if (!r.ok) return null;
     return await r.json();
@@ -2685,19 +2685,35 @@ app.listen(CONFIG.PORT, () => {
   setInterval(syncKamiyo, 3 * 60 * 60 * 1000); // Re-sync Kamiyo every 3h
 });
 
-// Kamiyo batch sync — fetch data for all scored agents
+// Kamiyo batch sync — lightweight check for all scored agents
 async function syncKamiyo() {
-  console.log('[Kamiyo Sync] Starting batch fetch for scored agents...');
+  console.log('[Kamiyo Sync] Starting...');
   let fetched = 0, withData = 0, errors = 0;
   const wallets = Array.from(REGISTRY.agents.keys());
   for (const wallet of wallets) {
     try {
-      const data = await fetchKamiyoData(wallet, true); // lightweight: reliability only
+      // Use 3s timeout for batch — skip quickly if Kamiyo doesn't know this wallet
+      const reliability = await getKamiyoReliability(wallet, 3000);
       fetched++;
-      if (data && data.metrics && data.metrics.total_jobs > 0) withData++;
+      if (reliability) {
+        const data = {
+          events: [],
+          reliability,
+          metrics: {
+            total_jobs: reliability.totalJobs || reliability.total_jobs || 0,
+            avg_quality: reliability.avgQuality || reliability.avg_quality || null,
+            avg_refund: reliability.avgRefund || reliability.avg_refund || null,
+            max_quality: null, min_quality: null,
+            high_quality_jobs: reliability.highQualityJobs || 0,
+            disputed_jobs: reliability.disputedJobs || 0,
+            services: reliability.services || [],
+          },
+          lastFetch: Date.now(),
+        };
+        REGISTRY.kamiyoData.set(wallet, data);
+        withData++;
+      }
     } catch (e) { errors++; }
-    // Short delay to not hammer Kamiyo API
-    if (fetched % 20 === 0) await new Promise(r => setTimeout(r, 500));
   }
-  console.log(`[Kamiyo Sync] Done: ${fetched} checked, ${withData} with data, ${errors} errors`);
+  console.log(`[Kamiyo Sync] Done: ${fetched}/${wallets.length} checked, ${withData} with data, ${errors} errors`);
 }
