@@ -2723,7 +2723,7 @@ app.get('/merchants/admin/applications', (req, res) => {
 // Admin: review an application (approve/reject + fill in details)
 app.post('/merchants/admin/review', (req, res) => {
   const { key, id, decision, business_name, description, category, website, x_handle,
-    banner_url, profile_image_url, services_offered, notes, payment_tier } = req.body;
+    banner_url, profile_image_url, services_offered, notes, payment_tier, x402_endpoint } = req.body;
   if (key !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
   if (!id || !decision) return res.status(400).json({ error: 'Missing id or decision' });
   if (!['approved', 'rejected'].includes(decision)) return res.status(400).json({ error: 'Decision must be approved or rejected' });
@@ -2749,7 +2749,8 @@ app.post('/merchants/admin/review', (req, res) => {
       banner_url: banner_url || app.banner_url || null,
       profile_image_url: profile_image_url || app.profile_image_url || null,
       services_offered: services_offered || app.services_offered || [],
-      payment_tier: payment_tier || 'standard', // standard, premium, enterprise
+      payment_tier: payment_tier || 'standard',
+      x402_endpoint: x402_endpoint || null,
       verified_at: new Date().toISOString(),
       applied_at: app.applied_at,
       fairscore: null, // Will be populated on first directory load
@@ -2772,7 +2773,7 @@ app.post('/merchants/admin/update', (req, res) => {
   if (key !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
   const merchant = MERCHANTS.verified.get(id);
   if (!merchant) return res.status(404).json({ error: 'Merchant not found' });
-  const allowed = ['business_name', 'description', 'category', 'website', 'x_handle', 'banner_url', 'profile_image_url', 'services_offered', 'payment_tier', 'notes'];
+  const allowed = ['business_name', 'description', 'category', 'website', 'x_handle', 'banner_url', 'profile_image_url', 'services_offered', 'payment_tier', 'notes', 'x402_endpoint'];
   for (const [k, v] of Object.entries(updates)) {
     if (allowed.includes(k)) merchant[k] = v;
   }
@@ -2795,7 +2796,7 @@ app.post('/merchants/admin/remove', (req, res) => {
 // Admin: directly add a verified merchant (skip application flow)
 app.post('/merchants/admin/add', (req, res) => {
   const { key, business_name, wallet, description, category, website, x_handle,
-    contact_email, banner_url, profile_image_url, services_offered, payment_tier } = req.body;
+    contact_email, banner_url, profile_image_url, services_offered, payment_tier, x402_endpoint } = req.body;
   if (key !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
   if (!business_name || !wallet) return res.status(400).json({ error: 'Missing business_name or wallet' });
 
@@ -2807,6 +2808,7 @@ app.post('/merchants/admin/add', (req, res) => {
     contact_email: contact_email || null,
     banner_url: banner_url || null, profile_image_url: profile_image_url || null,
     services_offered: services_offered || [], payment_tier: payment_tier || 'standard',
+    x402_endpoint: x402_endpoint || null,
     verified_at: new Date().toISOString(), applied_at: new Date().toISOString(),
     fairscore: null,
   };
@@ -2832,6 +2834,7 @@ app.get('/merchants', (req, res) => {
       website: m.website, x_handle: m.x_handle,
       banner_url: m.banner_url, profile_image_url: m.profile_image_url,
       services_offered: m.services_offered, payment_tier: m.payment_tier,
+      x402_endpoint: m.x402_endpoint || null,
       fairscore: m.fairscore, verified_at: m.verified_at,
     })),
   });
