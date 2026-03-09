@@ -2693,7 +2693,7 @@ const MERCHANTS = {
 
 // Merchant application (public — anyone can apply)
 app.post('/merchants/apply', (req, res) => {
-  const { business_name, wallet, website, x_handle, contact_email, description, category, services_offered } = req.body;
+  const { business_name, wallet, website, x_handle, contact_email, description, category, services_offered, x402_endpoint } = req.body;
   if (!business_name || !wallet || !contact_email) return res.status(400).json({ error: 'Missing required fields: business_name, wallet, contact_email' });
   if (wallet.length < 32 || wallet.length > 44) return res.status(400).json({ error: 'Invalid Solana wallet address' });
 
@@ -2701,7 +2701,7 @@ app.post('/merchants/apply', (req, res) => {
   const application = {
     id, business_name, wallet, website: website || null, x_handle: x_handle || null,
     contact_email, description: description || null, category: category || 'general',
-    services_offered: services_offered || [], status: 'pending',
+    services_offered: services_offered || [], x402_endpoint: x402_endpoint || null, status: 'pending',
     applied_at: new Date().toISOString(), reviewed_at: null, reviewed_by: null,
     banner_url: null, profile_image_url: null, notes: null,
   };
@@ -2750,7 +2750,7 @@ app.post('/merchants/admin/review', (req, res) => {
       profile_image_url: profile_image_url || app.profile_image_url || null,
       services_offered: services_offered || app.services_offered || [],
       payment_tier: payment_tier || 'standard',
-      x402_endpoint: x402_endpoint || null,
+      x402_endpoint: x402_endpoint || app.x402_endpoint || null,
       verified_at: new Date().toISOString(),
       applied_at: app.applied_at,
       fairscore: null, // Will be populated on first directory load
