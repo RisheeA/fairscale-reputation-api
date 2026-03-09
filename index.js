@@ -2792,6 +2792,32 @@ app.post('/merchants/admin/remove', (req, res) => {
   res.json({ success: true, deleted });
 });
 
+// Admin: directly add a verified merchant (skip application flow)
+app.post('/merchants/admin/add', (req, res) => {
+  const { key, business_name, wallet, description, category, website, x_handle,
+    contact_email, banner_url, profile_image_url, services_offered, payment_tier } = req.body;
+  if (key !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  if (!business_name || !wallet) return res.status(400).json({ error: 'Missing business_name or wallet' });
+
+  const id = `merch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const merchant = {
+    id, wallet, business_name,
+    description: description || null, category: category || 'general',
+    website: website || null, x_handle: x_handle || null,
+    contact_email: contact_email || null,
+    banner_url: banner_url || null, profile_image_url: profile_image_url || null,
+    services_offered: services_offered || [], payment_tier: payment_tier || 'standard',
+    verified_at: new Date().toISOString(), applied_at: new Date().toISOString(),
+    fairscore: null,
+  };
+  MERCHANTS.verified.set(id, merchant);
+  getOrCreateAgent(wallet).then(agent => {
+    if (agent) merchant.fairscore = agent.scores.agent_fairscore;
+  }).catch(() => {});
+  console.log(`[Merchant] Admin direct add: ${business_name} (${wallet.slice(0,8)}...)`);
+  res.json({ success: true, id, merchant });
+});
+
 // Public: list verified merchants
 app.get('/merchants', (req, res) => {
   const { category } = req.query;
