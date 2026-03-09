@@ -26,7 +26,7 @@ const CONFIG = {
   SAS_PROGRAM: 'attsHUrSzCyJqwjddBnTRFStKnPBHPbFTNsm8j22aVr',
   CLAWKEY_API: 'https://clawkey.ai/api',
   KAMIYO_API: 'https://api.kamiyo.ai/api/fusion/fairscale',
-  KAMIYO_READ_TOKEN: process.env.KAMIYO_READ_TOKEN,
+  KAMIYO_READ_TOKEN: process.env.KAMIYO_READ_TOKEN || '',
   SCORE_HISTORY_MAX: 10,  // Keep last N snapshots per wallet
   BETA_CODES: {
     ...(process.env.BETA_CODE_ADMIN ? { [process.env.BETA_CODE_ADMIN]: { type: 'unlimited', maxUses: Infinity } } : {}),
