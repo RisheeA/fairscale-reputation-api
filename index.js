@@ -497,7 +497,8 @@ async function syncFrom8004() {
         if (agent.wallet) {
           const existing = REGISTRY.agents.get(agent.wallet);
           const tag = { assetId: agent.assetId, name: agent.name, services: agent.services, skills: agent.skills };
-          if (!existing || Date.now() - new Date(existing.lastUpdated).getTime() > 600000) {
+          const isMinimal = existing?.breakdown?.no_api_data === true;
+          if (!existing || isMinimal || Date.now() - new Date(existing.lastUpdated).getTime() > 600000) {
             let saidVerify = null;
             if (REGISTRY.saidAgents.has(agent.wallet)) {
               try { const r = await fetch(`${CONFIG.SAID_API}/api/verify/${agent.wallet}`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(2000) }); if (r.ok) saidVerify = await r.json(); } catch(e) {}
@@ -1957,7 +1958,11 @@ function getRecommendationTier(score, verifications, wallet) {
 async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
   if (REGISTRY.agents.has(wallet)) {
     const cached = REGISTRY.agents.get(wallet);
-    if (Date.now() - new Date(cached.lastUpdated).getTime() < 1800000) return cached;
+    // Always re-score minimal agents (no API data) — they need a retry
+    const isMinimal = cached.breakdown?.no_api_data === true;
+    if (!isMinimal && Date.now() - new Date(cached.lastUpdated).getTime() < 1800000) return cached;
+    // For minimal agents, retry but only every 6 hours (not every sync)
+    if (isMinimal && Date.now() - new Date(cached.lastUpdated).getTime() < 6 * 60 * 60 * 1000) return cached;
   }
 
   const regData = REGISTRY.registeredAgents.get(wallet);
