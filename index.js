@@ -2708,7 +2708,7 @@ app.get('/v1/dashboard', (req, res) => {
     .slice(0, 10)
     .map((a, i) => ({
       rank: i + 1, wallet: a.wallet, name: a.name, agent_fairscore: a.scores.agent_fairscore,
-      recommendation: a.recommendation, sources: [
+      recommendation: a.recommendation, socials: a.socials || {}, sources: [
         a.isSaidAgent ? 'said' : null, a.verifications?.erc8004 ? 'erc8004' : null,
         a.verifications?.sati ? 'sati' : null
       ].filter(Boolean),
