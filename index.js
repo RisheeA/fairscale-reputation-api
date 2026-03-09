@@ -1987,8 +1987,90 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
   const socialHandle = saidHandle || knownHandle;
 
   if (!fairscaleData && !saidData) {
-    console.warn(`[Score] No data for ${wallet.slice(0,8)}... (both APIs returned null)`);
-    return null;
+    // Both APIs returned null — but this wallet IS registered on-chain.
+    // Score it based purely on verification signals (registry presence).
+    // Every agent deserves a score entry.
+    const onSaid = REGISTRY.saidAgents.has(wallet);
+    const on8004 = REGISTRY.erc8004ByWallet.has(wallet);
+    const onSati = REGISTRY.satiByWallet.has(wallet);
+    
+    if (!onSaid && !on8004 && !onSati && !REGISTRY.registeredAgents.has(wallet)) {
+      // Truly unknown wallet with zero presence anywhere — skip
+      return null;
+    }
+
+    // Build minimal agent with verification-only score
+    const erc8004Data = REGISTRY.erc8004ByWallet.get(wallet);
+    const satiAgent = REGISTRY.satiByWallet.get(wallet);
+    const regData2 = REGISTRY.registeredAgents.get(wallet);
+    const verificationScore = calculateVerificationScore(wallet, null, {});
+    const lending = calculateLendingScore(wallet);
+    
+    // Minimal score: 20% base (floor at 10) + verification pillar only
+    const minScore = Math.max(Math.round(10 + (verificationScore * 0.35) + (lending.hasData ? lending.score * 0.15 : 0)), 5);
+    
+    const agent = {
+      wallet,
+      name: regData2?.name || erc8004Data?.name || satiAgent?.name || null,
+      description: regData2?.description || erc8004Data?.description || satiAgent?.description || null,
+      website: regData2?.website || null,
+      mcp: regData2?.mcp || null,
+      scores: {
+        agent_fairscore: minScore,
+        fairscore_base: 0,
+        social_score: 0,
+        said_score: null,
+        said_trust_tier: null,
+        attestations: 0,
+        sati_reputation: satiAgent?.reputation || null,
+      },
+      breakdown: { verification: verificationScore, no_api_data: true, lending: lending.hasData ? lending : null },
+      percentiles: null,
+      recommendation: minScore >= 40 ? { tier: 'acceptable', label: 'Acceptable', color: 'yellow' } : { tier: 'caution', label: 'Use with Caution', color: 'orange' },
+      features: {
+        reliability: 10, track_record: 10, economic_stake: 10, ecosystem: 10,
+        verification: verificationScore, social: 0,
+        lending: lending.hasData ? lending.score : null,
+        desc_quality: 0,
+      },
+      verifications: {
+        clawkey: null,
+        said_onchain: onSaid,
+        erc8004: on8004,
+        sati: onSati,
+        kamiyo: REGISTRY.kamiyoData.has(wallet),
+        merchant_verified: Array.from(MERCHANTS.verified.values()).some(m => m.wallet === wallet),
+      },
+      erc8004: erc8004Data ? { assetId: erc8004Data.assetId, name: erc8004Data.name, services: erc8004Data.services || [], skills: erc8004Data.skills || [] } : null,
+      sati: satiAgent ? { assetId: satiAgent.assetId, name: satiAgent.name, services: satiAgent.services || [], skills: satiAgent.skills || [] } : null,
+      kamiyo: null,
+      attestation_graph: REGISTRY.attestationGraph.get(wallet) || null,
+      score_trend: getScoreTrend(wallet),
+      badges: [],
+      actions: [],
+      red_flags: [],
+      socials: {},
+      descriptions: {
+        reliability: 'No on-chain behavioral data available yet',
+        track_record: 'No transaction history from FairScale API',
+        economic_stake: 'Holdings data unavailable',
+        ecosystem: 'Protocol interaction data unavailable',
+        verification: getFeatureDescription('verification', verificationScore),
+        social: 'No social data available',
+      },
+      trust_summary: `Registered on-chain${onSaid ? ' (SAID)' : ''}${on8004 ? ' (ERC-8004)' : ''}${onSati ? ' (SATI)' : ''} but no behavioral data available from FairScale API. Score based on verification status only. Will improve as on-chain activity is detected.`,
+      isRegistered: REGISTRY.registeredAgents.has(wallet),
+      isSaidAgent: onSaid,
+      isVerified: REGISTRY.verifiedWallets.has(wallet),
+      services: [],
+      counterparties: null,
+      funder: null,
+      lastUpdated: new Date().toISOString(),
+    };
+
+    REGISTRY.agents.set(wallet, agent);
+    recordScoreHistory(wallet, minScore, agent.breakdown);
+    return agent;
   }
 
   // Debug: log response shapes for first 3 agents to understand available fields
