@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import 'dotenv/config';
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
 
 const app = express();
 app.use(cors());
@@ -61,6 +62,123 @@ const REGISTRY = {
   lastSaidSync: null,
   lastSatiSync: null,
 };
+
+// =============================================================================
+// PERSISTENCE — Save/load state to disk
+// =============================================================================
+// Survives Railway restarts and most redeploys. For guaranteed persistence,
+// attach a Railway volume at /data and set DATA_DIR=/data in env vars.
+
+const DATA_DIR = process.env.DATA_DIR || '/tmp/fairscale-data';
+const STATE_FILE = `${DATA_DIR}/registry-state.json`;
+const SAVE_INTERVAL = 5 * 60 * 1000; // Save every 5 minutes
+
+function ensureDataDir() {
+  try { if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true }); } catch (e) { console.warn('[Persist] Cannot create data dir:', e.message); }
+}
+
+function mapToObj(map) {
+  const obj = {};
+  for (const [k, v] of map) obj[k] = v;
+  return obj;
+}
+
+function objToMap(obj) {
+  const map = new Map();
+  if (obj && typeof obj === 'object') {
+    for (const [k, v] of Object.entries(obj)) map.set(k, v);
+  }
+  return map;
+}
+
+function saveState() {
+  try {
+    ensureDataDir();
+    const state = {
+      version: 15,
+      savedAt: new Date().toISOString(),
+      agents: mapToObj(REGISTRY.agents),
+      registeredAgents: mapToObj(REGISTRY.registeredAgents),
+      services: mapToObj(REGISTRY.services),
+      verifiedWallets: mapToObj(REGISTRY.verifiedWallets),
+      scoreHistory: mapToObj(REGISTRY.scoreHistory),
+      attestationGraph: mapToObj(REGISTRY.attestationGraph),
+      merchants: {
+        applications: mapToObj(MERCHANTS.applications),
+        verified: mapToObj(MERCHANTS.verified),
+      },
+      beta: {
+        users: mapToObj(BETA.users),
+        codeUses: mapToObj(BETA.codeUses),
+      },
+    };
+    writeFileSync(STATE_FILE, JSON.stringify(state));
+    const agentCount = REGISTRY.agents.size;
+    const merchantCount = MERCHANTS.verified.size;
+    console.log(`[Persist] Saved: ${agentCount} agents, ${merchantCount} merchants, ${BETA.users.size} beta users`);
+  } catch (e) {
+    console.error('[Persist] Save failed:', e.message);
+  }
+}
+
+function loadState() {
+  try {
+    if (!existsSync(STATE_FILE)) { console.log('[Persist] No saved state found — starting fresh'); return false; }
+    const raw = readFileSync(STATE_FILE, 'utf-8');
+    const state = JSON.parse(raw);
+    if (!state.version) { console.log('[Persist] Invalid state file — skipping'); return false; }
+
+    // Restore agents (with deduplication — keep highest score per wallet)
+    const agentData = state.agents || {};
+    for (const [wallet, agent] of Object.entries(agentData)) {
+      const existing = REGISTRY.agents.get(wallet);
+      if (!existing || (agent.scores?.agent_fairscore || 0) >= (existing.scores?.agent_fairscore || 0)) {
+        REGISTRY.agents.set(wallet, agent);
+      }
+    }
+
+    // Restore other maps
+    REGISTRY.registeredAgents = objToMap(state.registeredAgents);
+    REGISTRY.services = objToMap(state.services);
+    REGISTRY.verifiedWallets = objToMap(state.verifiedWallets);
+    REGISTRY.scoreHistory = objToMap(state.scoreHistory);
+    REGISTRY.attestationGraph = objToMap(state.attestationGraph);
+
+    // Restore merchants
+    if (state.merchants) {
+      for (const [k, v] of Object.entries(state.merchants.applications || {})) MERCHANTS.applications.set(k, v);
+      for (const [k, v] of Object.entries(state.merchants.verified || {})) MERCHANTS.verified.set(k, v);
+    }
+
+    // Restore beta users
+    if (state.beta) {
+      for (const [k, v] of Object.entries(state.beta.users || {})) BETA.users.set(k, v);
+      for (const [k, v] of Object.entries(state.beta.codeUses || {})) BETA.codeUses.set(k, v);
+    }
+
+    console.log(`[Persist] Restored: ${REGISTRY.agents.size} agents, ${MERCHANTS.verified.size} merchants, ${BETA.users.size} beta users (saved ${state.savedAt})`);
+    return true;
+  } catch (e) {
+    console.error('[Persist] Load failed:', e.message);
+    return false;
+  }
+}
+
+// Deduplication: ensure no wallet appears twice in the agents map
+// (shouldn't happen since Map keys are unique, but sync timing could cause stale entries)
+function deduplicateAgents() {
+  const walletScores = new Map();
+  for (const [wallet, agent] of REGISTRY.agents) {
+    const existing = walletScores.get(wallet);
+    if (!existing || (agent.scores?.agent_fairscore || 0) > (existing.scores?.agent_fairscore || 0)) {
+      walletScores.set(wallet, agent);
+    }
+  }
+  if (walletScores.size !== REGISTRY.agents.size) {
+    console.log(`[Dedup] Removed ${REGISTRY.agents.size - walletScores.size} duplicate agents`);
+    REGISTRY.agents = walletScores;
+  }
+}
 
 // =============================================================================
 // UTILITY: BASE58 ENCODER
@@ -389,6 +507,8 @@ async function syncFrom8004() {
     }
     console.log(`[8004 Sync] Done: ${imported} scored, ${enriched} metadata, ${nullWallets} null wallets, ${failed} failed / ${rawAgents.length}`);
     REGISTRY.lastErc8004Sync = new Date().toISOString();
+    deduplicateAgents();
+    saveState();
   } catch (e) { console.error('[8004 Sync] Error:', e.message); }
 }
 
@@ -425,6 +545,8 @@ async function syncFromSAID() {
     console.log(`[SAID Sync] Complete: ${imported} imported, ${failed} failed, ${REGISTRY.saidAgents.size} total`);
     console.log(`[Registry] Total agents in memory: ${REGISTRY.agents.size} | SAID: ${REGISTRY.saidAgents.size} | 8004: ${REGISTRY.erc8004Agents.size}`);
     REGISTRY.lastSaidSync = new Date().toISOString();
+    deduplicateAgents();
+    saveState();
   } catch (e) { console.error('[SAID Sync] Error:', e.message); }
 }
 
@@ -586,6 +708,8 @@ async function syncFromSATI() {
 
     // Build attestation graph for non-SATI agents too
     await buildAttestationGraph();
+    deduplicateAgents();
+    saveState();
   } catch (e) { console.error('[SATI Sync] Error:', e.message); }
 }
 
@@ -1828,6 +1952,7 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
       erc8004: REGISTRY.erc8004ByWallet.has(wallet),
       sati: REGISTRY.satiByWallet.has(wallet),
       kamiyo: REGISTRY.kamiyoData.has(wallet),
+      merchant_verified: Array.from(MERCHANTS.verified.values()).some(m => m.wallet === wallet),
     },
     erc8004: erc8004Tag,
     sati: REGISTRY.satiByWallet.has(wallet) ? {
@@ -2477,7 +2602,24 @@ app.get('/stats', (req, res) => {
     onBothProtocols: onBoth, onTripleProtocols: onTriple,
     lastErc8004Sync: REGISTRY.lastErc8004Sync, lastSaidSync: REGISTRY.lastSaidSync, lastSatiSync: REGISTRY.lastSatiSync,
     verificationProviders: { clawkey: 'active', said_onchain: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key', erc8004: CONFIG.HELIUS_API_KEY ? 'active' : 'no_key', sati: 'active' },
+    persistence: { data_dir: DATA_DIR, state_file: STATE_FILE, file_exists: existsSync(STATE_FILE) },
+    merchants: { applications: MERCHANTS.applications.size, verified: MERCHANTS.verified.size },
+    betaUsers: BETA.users.size,
   });
+});
+
+// --- Admin: Manual persistence ---
+app.post('/admin/save', (req, res) => {
+  if (req.body.apiKey !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  saveState();
+  res.json({ success: true, message: 'State saved', agents: REGISTRY.agents.size, merchants: MERCHANTS.verified.size });
+});
+
+app.post('/admin/dedup', (req, res) => {
+  if (req.body.apiKey !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  const before = REGISTRY.agents.size;
+  deduplicateAgents();
+  res.json({ success: true, before, after: REGISTRY.agents.size, removed: before - REGISTRY.agents.size });
 });
 
 // --- Task Profiles ---
@@ -2859,10 +3001,15 @@ app.get('/merchants/:id', (req, res) => {
 // START
 // =============================================================================
 
+// Load persisted state before starting
+loadState();
+deduplicateAgents();
+
 app.listen(CONFIG.PORT, () => {
   console.log(`FairScale Registry v15.0 on port ${CONFIG.PORT}`);
   console.log(`  Integrations: FairScale API, SAID Protocol, ERC-8004, SATI, SAS, ClawKey, Kamiyo`);
-  console.log(`  Features: Attestation Graph (v2 deduped), Score History, Task Profiles, Trust Gate, Merchant Verification`);
+  console.log(`  Features: Attestation Graph (v2 deduped), Score History, Task Profiles, Trust Gate, Merchant Verification, Persistence`);
+  console.log(`  Data dir: ${DATA_DIR}`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
   setTimeout(syncFromSATI, 30000);
@@ -2871,7 +3018,18 @@ app.listen(CONFIG.PORT, () => {
   setInterval(syncFrom8004, 6 * 60 * 60 * 1000);
   setInterval(syncFromSATI, 6 * 60 * 60 * 1000);
   setInterval(syncKamiyo, 3 * 60 * 60 * 1000);
+
+  // Periodic save every 5 minutes
+  setInterval(saveState, SAVE_INTERVAL);
+  // Save after initial sync completes (~2 minutes)
+  setTimeout(saveState, 120000);
+  // Dedup after syncs complete
+  setTimeout(deduplicateAgents, 180000);
 });
+
+// Save state on shutdown (SIGTERM from Railway, SIGINT from Ctrl+C)
+process.on('SIGTERM', () => { console.log('[Shutdown] Saving state...'); saveState(); process.exit(0); });
+process.on('SIGINT', () => { console.log('[Shutdown] Saving state...'); saveState(); process.exit(0); });
 
 // Kamiyo batch sync — lightweight check for all scored agents
 async function syncKamiyo() {
