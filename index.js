@@ -2467,11 +2467,11 @@ app.get('/directory', (req, res) => {
       features: a.features,
       isVerified: a.isVerified,
       humanVerified: a.verifications?.clawkey?.verified || false,
-      services: a.services.length + (a.erc8004?.services?.length || 0),
+      services: (a.services?.length || 0) + (a.erc8004?.services?.length || 0),
       sources,
       boosts,
       said: onSaid ? { pda: REGISTRY.saidAgents.get(a.wallet)?.pda || null, score: a.scores.said_score, trustTier: a.scores.said_trust_tier, feedbackCount: a.scores.attestations } : null,
-      erc8004: on8004 ? { assetId: a.erc8004.assetId, name: a.erc8004.name, skills: a.erc8004.skills || [], services: a.erc8004.services || [] } : null,
+      erc8004: on8004 ? { assetId: a.erc8004?.assetId || REGISTRY.erc8004ByWallet.get(a.wallet)?.assetId || null, name: a.erc8004?.name || REGISTRY.erc8004ByWallet.get(a.wallet)?.name || null, skills: a.erc8004?.skills || [], services: a.erc8004?.services || [] } : null,
     };
   });
 
@@ -3010,6 +3010,19 @@ app.get('/merchants/:id', (req, res) => {
 // START
 // =============================================================================
 
+// Save state on shutdown — register BEFORE listen so they're active early
+let shuttingDown = false;
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[Shutdown] ${signal} received — saving state...`);
+  try { saveState(); } catch (e) { console.error('[Shutdown] Save failed:', e.message); }
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('beforeExit', () => { if (!shuttingDown) { console.log('[beforeExit] Saving state...'); try { saveState(); } catch(e) {} } });
+
 // Load persisted state before starting
 loadState();
 deduplicateAgents();
@@ -3035,10 +3048,6 @@ app.listen(CONFIG.PORT, () => {
   // Dedup after syncs complete
   setTimeout(deduplicateAgents, 180000);
 });
-
-// Save state on shutdown (SIGTERM from Railway, SIGINT from Ctrl+C)
-process.on('SIGTERM', () => { console.log('[Shutdown] Saving state...'); saveState(); process.exit(0); });
-process.on('SIGINT', () => { console.log('[Shutdown] Saving state...'); saveState(); process.exit(0); });
 
 // Kamiyo batch sync — lightweight check for all scored agents
 async function syncKamiyo() {
