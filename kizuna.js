@@ -126,6 +126,14 @@ function ingestTrustEvent(event) {
   // Invalidate cached score for this entity
   KIZUNA.scores.delete(event.entityId);
 
+  // Feed back into main FairScale scoring — invalidate the agent cache
+  // so the next time this wallet is scored, it picks up the new trust data.
+  // Events like repayment_received, default_recorded, dispute_lost directly
+  // affect the Kamiyo reliability metrics which feed into the Agent FairScore.
+  if (KIZUNA._registry?.agents) {
+    KIZUNA._registry.agents.delete(event.entityId);
+  }
+
   return { accepted: true, eventId: event.eventId, ingestedAt: stored.ingestedAt };
 }
 
@@ -250,7 +258,7 @@ function calculateKizunaFairScore(entityId) {
   if (identityVerified > 0) { verificationScore += 40; reasons.push(REASON_CODES.VERIFIED_IDENTITY); }
   if (merchantVerified > 0) { verificationScore += 30; reasons.push(REASON_CODES.VERIFIED_MERCHANT); }
   // Also check existing FairScale verification
-  const agentData = REGISTRY.agents.get(entityId);
+  const agentData = KIZUNA._registry?.agents?.get(entityId);
   if (agentData?.verifications?.said_onchain) verificationScore += 5;
   if (agentData?.verifications?.erc8004) verificationScore += 5;
   if (agentData?.verifications?.clawkey?.verified) verificationScore += 10;
@@ -615,7 +623,13 @@ function loadKizunaState(state) {
 // 6. API ROUTES
 // ---------------------------------------------------------------------------
 
-function registerKizunaRoutes(app, CONFIG) {
+function registerKizunaRoutes(app, CONFIG, registry) {
+
+  // Make REGISTRY available to scoring functions
+  if (registry) {
+    // Store reference for use in calculateKizunaFairScore
+    KIZUNA._registry = registry;
+  }
 
   // --- Middleware: Kamiyo auth for write endpoints ---
   const kizunaAuth = (req, res, next) => {
