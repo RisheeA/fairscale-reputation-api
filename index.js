@@ -3040,7 +3040,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('beforeExit', () => { if (!shuttingDown) { console.log('[beforeExit] Saving state...'); try { saveState(); } catch(e) {} } });
 
 // Register Kizuna routes
-registerKizunaRoutes(app, CONFIG);
+registerKizunaRoutes(app, CONFIG, REGISTRY);
 
 // Load persisted state before starting
 loadState();
