@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config';
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
-import { KIZUNA, registerKizunaRoutes, saveKizunaState, loadKizunaState } from './kizuna.js';
+import { KIZUNA, registerKizunaRoutes, saveKizunaState, loadKizunaState, getEntityEvents } from './kizuna.js';
 
 const app = express();
 app.use(cors());
@@ -1489,6 +1489,65 @@ function hasMeaningfulSocialData(fairscaleData, saidData, satiData) {
   return false;
 }
 
+// --- LENDING PERFORMANCE PILLAR ---
+// Separate pillar fed by Kizuna trust events. Measures credit behavior:
+// repayments, settlements, defaults, disputes. Defaults slash score hard.
+function calculateLendingScore(wallet) {
+  const events = getEntityEvents(wallet);
+  if (events.length === 0) return { score: null, hasData: false, defaults: 0, repayments: 0, summary: null };
+
+  // Count relevant event types
+  const counts = {};
+  for (const e of events) counts[e.type] = (counts[e.type] || 0) + 1;
+
+  const repayments = counts.repayment_received || 0;
+  const settlements = counts.settlement_confirmed || 0;
+  const defaults = counts.default_recorded || 0;
+  const disputesLost = counts.dispute_lost || 0;
+  const disputesWon = counts.dispute_won || 0;
+  const disputesOpened = counts.dispute_opened || 0;
+  const refunds = counts.service_refunded || 0;
+
+  const totalCreditEvents = repayments + settlements + defaults;
+  if (totalCreditEvents === 0 && disputesOpened === 0) {
+    return { score: null, hasData: false, defaults: 0, repayments: 0, summary: null };
+  }
+
+  let score = 50; // Neutral start
+
+  // Repayment performance (dominant signal)
+  if (totalCreditEvents > 0) {
+    const repayRate = (repayments + settlements) / totalCreditEvents;
+    score = Math.round(repayRate * 80) + 10; // 10-90 range from repayment alone
+  }
+
+  // DEFAULT SLASH — this is the big one
+  // Each default is a catastrophic trust signal
+  if (defaults >= 3) score = Math.min(score, 5);       // 3+ defaults = floor
+  else if (defaults === 2) score = Math.min(score, 15); // 2 defaults = near floor
+  else if (defaults === 1) score = Math.min(score, 30); // 1 default = severe cap
+
+  // Dispute losses compound the damage
+  if (disputesLost > 0) score = Math.max(score - (disputesLost * 8), 5);
+
+  // Dispute wins are mildly positive
+  if (disputesWon > 0) score = Math.min(score + (disputesWon * 3), 100);
+
+  // Volume bonus — consistent repayment over time is positive
+  if (repayments >= 20 && defaults === 0) score = Math.min(score + 10, 100);
+  else if (repayments >= 10 && defaults === 0) score = Math.min(score + 5, 100);
+
+  score = Math.max(Math.min(Math.round(score), 100), 0);
+
+  const summary = defaults > 0
+    ? `${defaults} default${defaults > 1 ? 's' : ''} recorded. ${repayments} successful repayments.`
+    : repayments > 0
+      ? `${repayments} successful repayments, ${settlements} settlements. No defaults.`
+      : `${disputesOpened} disputes opened, ${disputesLost} lost.`;
+
+  return { score, hasData: true, defaults, repayments, settlements, disputesLost, disputesOpened, summary };
+}
+
 // --- RED FLAG DETECTION ---
 // Returns a penalty from 0 (no flags) to -15 (severe)
 function detectRedFlags(fairscaleData) {
@@ -1689,12 +1748,23 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
   const verificationScore = calculateVerificationScore(wallet, saidData, verifications);
   const socialScore = calculateSocialScore(fairscaleData, saidData, satiData);
   const hasSocialData = hasMeaningfulSocialData(fairscaleData, saidData, satiData);
+  const lending = calculateLendingScore(wallet);
+  const hasLendingData = lending.hasData;
 
   // Select weight profile: task-specific or default with dynamic redistribution
   let weights;
   if (taskProfile && TASK_PROFILES[taskProfile]) {
     weights = { ...TASK_PROFILES[taskProfile] };
-    // Still redistribute social weight if no data
+    // Add lending weight if data exists
+    if (hasLendingData) {
+      // Take lending weight proportionally from all other pillars
+      weights.lending = 0.15;
+      const scale = 0.85;
+      for (const k of Object.keys(weights)) { if (k !== 'lending') weights[k] *= scale; }
+    } else {
+      weights.lending = 0;
+    }
+    // Redistribute social weight if no data
     if (!hasSocialData && weights.social > 0) {
       const socialW = weights.social;
       weights.social = 0;
@@ -1702,11 +1772,17 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
       weights.reliability += socialW * 0.4;
       weights.track_record += socialW * 0.2;
     }
+  } else if (hasLendingData && hasSocialData) {
+    weights = { verification: 0.28, reliability: 0.18, social: 0.10, track_record: 0.11, economic_stake: 0.07, ecosystem: 0.08, lending: 0.18 };
+  } else if (hasLendingData && !hasSocialData) {
+    weights = { verification: 0.32, reliability: 0.20, social: 0, track_record: 0.13, economic_stake: 0.08, ecosystem: 0.08, lending: 0.19 };
   } else if (hasSocialData) {
-    weights = { verification: 0.35, reliability: 0.22, social: 0.12, track_record: 0.13, economic_stake: 0.08, ecosystem: 0.10 };
+    weights = { verification: 0.35, reliability: 0.22, social: 0.12, track_record: 0.13, economic_stake: 0.08, ecosystem: 0.10, lending: 0 };
   } else {
-    weights = { verification: 0.40, reliability: 0.25, social: 0, track_record: 0.16, economic_stake: 0.09, ecosystem: 0.10 };
+    weights = { verification: 0.40, reliability: 0.25, social: 0, track_record: 0.16, economic_stake: 0.09, ecosystem: 0.10, lending: 0 };
   }
+
+  const lendingScore = lending.score || 0;
 
   const trustComposite = (
     (verificationScore * weights.verification) +
@@ -1714,8 +1790,16 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
     (socialScore * weights.social) +
     (features.track_record * weights.track_record) +
     (features.economic_stake * weights.economic_stake) +
-    (features.ecosystem * weights.ecosystem)
+    (features.ecosystem * weights.ecosystem) +
+    (lendingScore * (weights.lending || 0))
   );
+
+  // DEFAULT PENALTY — applied DIRECTLY to final score, not just pillar
+  // This is the hard slash: any default within 90 days = major score hit
+  let defaultPenalty = 0;
+  if (lending.defaults >= 3) defaultPenalty = -25;
+  else if (lending.defaults === 2) defaultPenalty = -18;
+  else if (lending.defaults === 1) defaultPenalty = -12;
 
   // Attestation graph boost (up to +12 points)
   // CONSERVATIVE: Only real, deduplicated attestations from SCORED attesters count.
@@ -1770,12 +1854,18 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
   const kamiyoData = REGISTRY.kamiyoData.get(wallet);
   const kamiyoBoosts = calculateKamiyoBoosts(kamiyoData);
 
-  let blended = (fsBaseNormalized * 0.20) + (trustComposite * 0.80) + attestationBoost + descBoost + multiRegistryBonus;
+  let blended = (fsBaseNormalized * 0.20) + (trustComposite * 0.80) + attestationBoost + descBoost + multiRegistryBonus + defaultPenalty;
 
   const { penalty, flags } = detectRedFlags(fairscaleData);
   blended += penalty;
   blended += kamiyoBoosts.redFlagPenalty;
   flags.push(...kamiyoBoosts.flags);
+
+  // Lending default flags — these are severe
+  if (lending.defaults >= 3) flags.push('multiple_credit_defaults');
+  else if (lending.defaults === 2) flags.push('repeated_credit_default');
+  else if (lending.defaults === 1) flags.push('credit_default');
+  if (lending.disputesLost >= 2) flags.push('multiple_disputes_lost');
 
   // Score trend penalty: sudden drops are suspicious
   const trend = getScoreTrend(wallet);
@@ -1817,6 +1907,15 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
       metrics: kamiyoData.metrics,
     } : null,
     multi_registry_bonus: multiRegistryBonus,
+    lending: hasLendingData ? {
+      score: lendingScore,
+      defaults: lending.defaults,
+      repayments: lending.repayments,
+      settlements: lending.settlements,
+      disputesLost: lending.disputesLost,
+      summary: lending.summary,
+      default_penalty: defaultPenalty,
+    } : null,
     red_flag_penalty: penalty,
     red_flags: flags,
     time_decay: decay,
@@ -1949,6 +2048,7 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
       track_record: Math.min((features.track_record || 0) + (breakdown.kamiyo?.track_record_boost || 0), 100),
       verification: breakdown.verification,
       social: breakdown.social,
+      lending: breakdown.lending?.score || null,
       desc_quality: descQuality,
     },
     verifications: {
