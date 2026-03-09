@@ -26,13 +26,13 @@ const CONFIG = {
   SAS_PROGRAM: 'attsHUrSzCyJqwjddBnTRFStKnPBHPbFTNsm8j22aVr',
   CLAWKEY_API: 'https://clawkey.ai/api',
   KAMIYO_API: 'https://api.kamiyo.ai/api/fusion/fairscale',
-  KAMIYO_READ_TOKEN: process.env.KAMIYO_READ_TOKEN || 'b05486f1633b8e8528de5778cbade0a53da010c0e0ae3ed2',
+  KAMIYO_READ_TOKEN: process.env.KAMIYO_READ_TOKEN,
   SCORE_HISTORY_MAX: 10,  // Keep last N snapshots per wallet
   BETA_CODES: {
-    [process.env.BETA_CODE_ADMIN || 'Ch@os123']: { type: 'unlimited', maxUses: Infinity },
-    [process.env.BETA_CODE_INVITE || 'fAIRgent123']: { type: 'limited', maxUses: 20 },
+    ...(process.env.BETA_CODE_ADMIN ? { [process.env.BETA_CODE_ADMIN]: { type: 'unlimited', maxUses: Infinity } } : {}),
+    ...(process.env.BETA_CODE_INVITE ? { [process.env.BETA_CODE_INVITE]: { type: 'limited', maxUses: 20 } } : {}),
   },
-  ADMIN_KEY: process.env.ADMIN_KEY || 'fairscale-admin-2026',
+  ADMIN_KEY: process.env.ADMIN_KEY,
 };
 
 // =============================================================================
