@@ -2975,6 +2975,15 @@ app.get('/merchants', (req, res) => {
   const { category } = req.query;
   let merchants = Array.from(MERCHANTS.verified.values());
   if (category) merchants = merchants.filter(m => m.category === category);
+  // Pull live scores and names from the agent registry
+  merchants.forEach(m => {
+    const agent = REGISTRY.agents.get(m.wallet);
+    if (agent) {
+      m.fairscore = agent.scores.agent_fairscore;
+      // Use agent name if merchant doesn't have a custom override
+      if (agent.name && !m._name_override) m.display_name = agent.name;
+    }
+  });
   merchants.sort((a, b) => (b.fairscore || 0) - (a.fairscore || 0));
   res.json({
     total: merchants.length,
