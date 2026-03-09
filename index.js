@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config';
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
+import { KIZUNA, registerKizunaRoutes, saveKizunaState, loadKizunaState } from './kizuna.js';
 
 const app = express();
 app.use(cors());
@@ -111,6 +112,7 @@ function saveState() {
         users: mapToObj(BETA.users),
         codeUses: mapToObj(BETA.codeUses),
       },
+      kizuna: saveKizunaState(),
     };
     writeFileSync(STATE_FILE, JSON.stringify(state));
     const agentCount = REGISTRY.agents.size;
@@ -155,6 +157,9 @@ function loadState() {
       for (const [k, v] of Object.entries(state.beta.users || {})) BETA.users.set(k, v);
       for (const [k, v] of Object.entries(state.beta.codeUses || {})) BETA.codeUses.set(k, v);
     }
+
+    // Restore Kizuna trust system
+    if (state.kizuna) loadKizunaState(state.kizuna);
 
     console.log(`[Persist] Restored: ${REGISTRY.agents.size} agents, ${MERCHANTS.verified.size} merchants, ${BETA.users.size} beta users (saved ${state.savedAt})`);
     return true;
@@ -2047,6 +2052,16 @@ app.get('/', (req, res) => {
         'GET /v1/score-history?wallet=': 'Score trend and history for a wallet',
         'GET /v1/attestation-graph?wallet=': 'Attestation network data for a wallet',
         'GET /v1/health': 'Health check',
+      },
+      kizuna: {
+        'POST /kizuna/trust-events': 'Ingest signed trust events (batch supported, requires x-kizuna-key header)',
+        'GET /kizuna/fairscore/:entityId': 'Get KizunaFairScore for wallet or agent (public)',
+        'POST /kizuna/decisions/evaluate': 'Underwriting decision (requires x-kizuna-key header)',
+        'GET /kizuna/reliability/:entityId': 'Reliability summary (public)',
+        'GET /kizuna/events/:entityId': 'Recent trust event feed (?type&since&limit)',
+        'GET /kizuna/decisions/:nonce': 'Retrieve past decision by nonce (requires x-kizuna-key)',
+        'GET /kizuna/stats': 'Kizuna system health metrics',
+        'GET /kizuna/policy': 'Current policy, risk bands, reason codes, event types',
       }
     },
     endpoints: {
@@ -2605,6 +2620,7 @@ app.get('/stats', (req, res) => {
     persistence: { data_dir: DATA_DIR, state_file: STATE_FILE, file_exists: existsSync(STATE_FILE) },
     merchants: { applications: MERCHANTS.applications.size, verified: MERCHANTS.verified.size },
     betaUsers: BETA.users.size,
+    kizuna: { trustEvents: KIZUNA.events.size, entities: KIZUNA.eventsByEntity.size, decisions: KIZUNA.decisions.size, scores: KIZUNA.scores.size },
   });
 });
 
@@ -3023,6 +3039,9 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('beforeExit', () => { if (!shuttingDown) { console.log('[beforeExit] Saving state...'); try { saveState(); } catch(e) {} } });
 
+// Register Kizuna routes
+registerKizunaRoutes(app, CONFIG);
+
 // Load persisted state before starting
 loadState();
 deduplicateAgents();
@@ -3030,7 +3049,7 @@ deduplicateAgents();
 app.listen(CONFIG.PORT, () => {
   console.log(`FairScale Registry v15.0 on port ${CONFIG.PORT}`);
   console.log(`  Integrations: FairScale API, SAID Protocol, ERC-8004, SATI, SAS, ClawKey, Kamiyo`);
-  console.log(`  Features: Attestation Graph (v2 deduped), Score History, Task Profiles, Trust Gate, Merchant Verification, Persistence`);
+  console.log(`  Features: Attestation Graph (v2 deduped), Score History, Task Profiles, Trust Gate, Merchant Verification, Persistence, Kizuna MVP`);
   console.log(`  Data dir: ${DATA_DIR}`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
