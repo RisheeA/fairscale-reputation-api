@@ -1286,6 +1286,10 @@ function calculateVerificationScore(wallet, saidData, verifications) {
   // Self-registration
   if (REGISTRY.registeredAgents.has(wallet)) score += 3;
 
+  // Verified merchant — approved and paying merchant on FairScale
+  const isMerchant = Array.from(MERCHANTS.verified.values()).some(m => m.wallet === wallet);
+  if (isMerchant) score += 7;
+
   return clamp(score, 0, 100);
 }
 
@@ -2323,6 +2327,8 @@ app.get('/directory', (req, res) => {
     if (a.verifications?.clawkey?.verified) boosts.clawkey_human = '+10';
     if (a.scores?.said_score > 0) boosts.said_reputation = `+${Math.min((a.scores.attestations || 0) * 3, 12)}`;
     if (a.scores?.said_trust_tier === 'high') boosts.said_trust = '+4';
+    const isMerchantAgent = Array.from(MERCHANTS.verified.values()).some(m => m.wallet === a.wallet);
+    if (isMerchantAgent) boosts.verified_merchant = '+7';
 
     return {
       rank: offset + i + 1,
@@ -2756,7 +2762,8 @@ app.post('/merchants/admin/review', (req, res) => {
       fairscore: null, // Will be populated on first directory load
     };
     MERCHANTS.verified.set(id, merchant);
-    // Also score their wallet
+    // Force re-score their wallet so the +7 merchant boost applies immediately
+    REGISTRY.agents.delete(app.wallet);
     getOrCreateAgent(app.wallet).then(agent => {
       if (agent) merchant.fairscore = agent.scores.agent_fairscore;
     }).catch(() => {});
@@ -2813,6 +2820,7 @@ app.post('/merchants/admin/add', (req, res) => {
     fairscore: null,
   };
   MERCHANTS.verified.set(id, merchant);
+  REGISTRY.agents.delete(wallet); // Force re-score so +7 merchant boost applies
   getOrCreateAgent(wallet).then(agent => {
     if (agent) merchant.fairscore = agent.scores.agent_fairscore;
   }).catch(() => {});
