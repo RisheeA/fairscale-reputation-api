@@ -539,28 +539,42 @@ async function syncFromSATI() {
         if (feedbacks.length > 0) {
           const attesters = feedbacks.map(fb => ({
             wallet: fb.clientAddress || 'sati_reviewer',
-            score: fb.value != null ? fb.value : 50,
+            score: fb.value != null ? Math.min(fb.value, 100) : null, // Cap at 100, null if unknown
             timestamp: fb.createdAt ? new Date(fb.createdAt * 1000).toISOString() : null,
             type: 'sati_feedback',
             tag: fb.tag1 || null,
             outcome: fb.outcome,
             message: fb.message || null,
+            _dedup_key: fb.clientAddress ? `sati_${fb.clientAddress}_${mint}` : `sati_anon_${fb.createdAt}_${mint}`,
           }));
 
+          // DEDUP: merge with existing but never duplicate by _dedup_key
           const existing = REGISTRY.attestationGraph.get(agent.wallet);
-          const merged = existing ? [...existing.attesters, ...attesters] : attesters;
-          const sa = merged.filter(a => a.score != null);
+          const existingKeys = new Set((existing?.attesters || []).map(a => a._dedup_key).filter(Boolean));
+          const newOnly = attesters.filter(a => !existingKeys.has(a._dedup_key));
+          const merged = [...(existing?.attesters || []), ...newOnly];
+          // Also dedup by wallet: keep only the latest feedback per reviewer
+          const byWallet = new Map();
+          for (const a of merged) {
+            const key = a.wallet || a._dedup_key;
+            const prev = byWallet.get(key);
+            if (!prev || (a.timestamp && (!prev.timestamp || a.timestamp > prev.timestamp))) {
+              byWallet.set(key, a);
+            }
+          }
+          const deduped = Array.from(byWallet.values());
+          const sa = deduped.filter(a => a.score != null);
 
           REGISTRY.attestationGraph.set(agent.wallet, {
-            attesters: merged,
-            attester_count: merged.length,
+            attesters: deduped,
+            attester_count: deduped.length,
             scored_attesters: sa.length,
             weighted_score: sa.length > 0 ? Math.round(sa.reduce((s, a) => s + (a.score * a.score / 100), 0) / sa.reduce((s, a) => s + a.score / 100, 0)) : 0,
             highest_attester: sa.length > 0 ? Math.max(...sa.map(a => a.score)) : 0,
             updated_at: new Date().toISOString(),
           });
-          feedbackCount += feedbacks.length;
-          console.log(`[SATI Feedback] ${agent.name || mint.slice(0,8)}: ${feedbacks.length} feedbacks → ${merged.length} total attesters`);
+          feedbackCount += newOnly.length;
+          console.log(`[SATI Feedback] ${agent.name || mint.slice(0,8)}: ${feedbacks.length} feedbacks, ${newOnly.length} new → ${deduped.length} unique attesters`);
         }
         await new Promise(r => setTimeout(r, 250));
       } catch (e) {}
@@ -588,42 +602,10 @@ async function buildAttestationGraph() {
 
   let processed = 0, totalAttestations = 0;
 
-  // Phase 1: Use SAID reputation data as attestation source
-  // SAID feedbackCount represents peer attestations within the SAID protocol
+  // Phase 1: SAID reputation is already reflected in verification + social pillars.
+  // We do NOT create fake attesters from feedbackCount — that inflates scores and is gameable.
+  // Only real, on-chain attestations with verifiable attester wallets count here.
   for (const [wallet] of REGISTRY.saidAgents) {
-    const agent = REGISTRY.agents.get(wallet);
-    if (!agent) continue;
-    const feedbackCount = agent.scores?.attestations || 0;
-    const saidRepScore = agent.scores?.said_score || 0;
-
-    if (feedbackCount > 0 || saidRepScore > 0) {
-      // Treat SAID reputation as implicit attestations
-      const attesters = [];
-      // Each feedback is an implicit attestation — we don't know the attester wallet
-      // but we can use the count and SAID's own reputation score as quality signal
-      for (let i = 0; i < Math.min(feedbackCount, 10); i++) {
-        attesters.push({
-          wallet: `said_feedback_${i}`,
-          score: saidRepScore > 0 ? Math.min(saidRepScore * 10, 80) : 40, // SAID score as quality proxy
-          timestamp: null, type: 'said_feedback', signature: null,
-        });
-      }
-
-      if (attesters.length > 0) {
-        const scored = attesters.filter(a => a.score != null);
-        const weightedSum = scored.reduce((s, a) => s + (a.score * a.score / 100), 0);
-        const totalWeight = scored.reduce((s, a) => s + a.score / 100, 0);
-        const weightedScore = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 0;
-
-        REGISTRY.attestationGraph.set(wallet, {
-          attesters, attester_count: attesters.length, scored_attesters: scored.length,
-          weighted_score: weightedScore,
-          highest_attester: Math.max(...scored.map(a => a.score)),
-          updated_at: new Date().toISOString(),
-        });
-        totalAttestations += attesters.length;
-      }
-    }
     processed++;
   }
 
@@ -672,15 +654,28 @@ async function buildAttestationGraph() {
 
       if (attesters.length > 0) {
         const existing = REGISTRY.attestationGraph.get(wallet);
-        const merged = existing ? [...existing.attesters, ...attesters] : attesters;
-        const scored = merged.filter(a => a.score != null);
-        const unscored = merged.filter(a => a.score == null);
-        const weightedSum = scored.reduce((s, a) => s + (a.score * a.score / 100), 0) + unscored.length * 16;
-        const totalWeight = scored.reduce((s, a) => s + a.score / 100, 0) + unscored.length * 0.4;
+        // DEDUP: merge but never duplicate by signature
+        const existingSigs = new Set((existing?.attesters || []).filter(a => a.signature).map(a => a.signature));
+        const newOnly = attesters.filter(a => !existingSigs.has(a.signature));
+        const merged = [...(existing?.attesters || []), ...newOnly];
+        // Further dedup: one attestation per attester wallet (keep latest)
+        const byWallet = new Map();
+        for (const a of merged) {
+          const key = a.wallet;
+          const prev = byWallet.get(key);
+          if (!prev || (a.timestamp && (!prev.timestamp || a.timestamp > prev.timestamp))) {
+            byWallet.set(key, a);
+          }
+        }
+        const deduped = Array.from(byWallet.values());
+        const scored = deduped.filter(a => a.score != null && a.score > 0);
+        // STRICT: Only scored attesters contribute to weighted score — no phantom points for unknowns
+        const weightedSum = scored.reduce((s, a) => s + (a.score * a.score / 100), 0);
+        const totalWeight = scored.reduce((s, a) => s + a.score / 100, 0);
         const weightedScore = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 0;
 
         REGISTRY.attestationGraph.set(wallet, {
-          attesters: merged, attester_count: merged.length, scored_attesters: scored.length,
+          attesters: deduped, attester_count: deduped.length, scored_attesters: scored.length,
           weighted_score: weightedScore, highest_attester: scored.length > 0 ? Math.max(...scored.map(a => a.score)) : 0,
           updated_at: new Date().toISOString(),
         });
@@ -1589,26 +1584,37 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
     (features.ecosystem * weights.ecosystem)
   );
 
-  // Attestation graph boost (up to +25 points)
-  // Attestations are RARE and extremely valuable — an agent with real peer feedback
-  // from verified reviewers is significantly more trustworthy than one without.
+  // Attestation graph boost (up to +12 points)
+  // CONSERVATIVE: Only real, deduplicated attestations from SCORED attesters count.
+  // Unscored/anonymous attestations get zero boost — you must be a known entity to vouch.
+  // Count-based boosts are logarithmic to prevent gaming via volume.
   const graphData = REGISTRY.attestationGraph.get(wallet);
   let attestationBoost = 0;
   if (graphData) {
-    const count = graphData.attester_count || 0;
-    const wScore = graphData.weighted_score || 0;
-    const highAttester = graphData.highest_attester || 0;
+    // Only count UNIQUE, SCORED attesters (deduplicated by wallet)
+    const uniqueScored = new Map();
+    for (const a of (graphData.attesters || [])) {
+      if (a.score != null && a.score > 0 && a.wallet && !a.wallet.startsWith('said_feedback')) {
+        // Keep highest score per unique attester wallet
+        const existing = uniqueScored.get(a.wallet);
+        if (!existing || a.score > existing.score) uniqueScored.set(a.wallet, a);
+      }
+    }
+    const uniqueCount = uniqueScored.size;
+    const scoredAttesters = Array.from(uniqueScored.values());
 
-    // Base: each attester is worth significant points (diminishing returns)
-    const countBoost = Math.min(count, 10) * 3 + Math.max(count - 10, 0) * 1;
-    // Weighted score quality multiplier (0-100 scale → 0-8 bonus)
-    const qualityBoost = Math.round(wScore * 0.08);
-    // High-trust attester bonus
-    const highTrustBoost = highAttester >= 80 ? 5 : highAttester >= 60 ? 3 : highAttester >= 40 ? 1 : 0;
-    // Having ANY attestation at all is a trust signal (most agents have 0)
-    const existenceBoost = count > 0 ? 5 : 0;
+    if (uniqueCount > 0) {
+      // Logarithmic count boost: 1=2pts, 3=4pts, 5=5pts, 10=7pts — hard to game with volume
+      const countBoost = Math.min(Math.round(Math.log2(uniqueCount + 1) * 2.5), 7);
+      // Quality: average attester score matters — only high-score attesters move the needle
+      const avgAttesterScore = scoredAttesters.reduce((s, a) => s + a.score, 0) / uniqueCount;
+      const qualityBoost = avgAttesterScore >= 60 ? 3 : avgAttesterScore >= 40 ? 1 : 0;
+      // High-trust attester: only if they score 70+ (genuinely trusted)
+      const highestAttester = Math.max(...scoredAttesters.map(a => a.score));
+      const highTrustBoost = highestAttester >= 70 ? 2 : 0;
 
-    attestationBoost = Math.min(countBoost + qualityBoost + highTrustBoost + existenceBoost, 25);
+      attestationBoost = Math.min(countBoost + qualityBoost + highTrustBoost, 12);
+    }
   }
 
   // Description quality boost (up to +5 points)
@@ -1622,8 +1628,8 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
   const onSati = REGISTRY.satiByWallet.has(wallet);
   const registryCount = (onSaid ? 1 : 0) + (on8004 ? 1 : 0) + (onSati ? 1 : 0);
   let multiRegistryBonus = 0;
-  if (registryCount >= 3) multiRegistryBonus = 15;
-  else if (registryCount >= 2) multiRegistryBonus = 10;
+  if (registryCount >= 3) multiRegistryBonus = 8;
+  else if (registryCount >= 2) multiRegistryBonus = 5;
 
   // Blend: 20% FairScale base, 80% trust composite + bonuses
   // Trust composite is where verification, reliability, etc. live — it should dominate
@@ -1631,7 +1637,7 @@ function calculateAgentFairScore(fairscaleData, features, saidData, wallet, veri
   const kamiyoData = REGISTRY.kamiyoData.get(wallet);
   const kamiyoBoosts = calculateKamiyoBoosts(kamiyoData);
 
-  let blended = (fsBaseNormalized * 0.20) + (trustComposite * 0.80) + attestationBoost + kamiyoBoosts.attestationBoost + descBoost + multiRegistryBonus;
+  let blended = (fsBaseNormalized * 0.20) + (trustComposite * 0.80) + attestationBoost + descBoost + multiRegistryBonus;
 
   const { penalty, flags } = detectRedFlags(fairscaleData);
   blended += penalty;
@@ -1899,7 +1905,7 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
 app.get('/', (req, res) => {
   res.json({
     service: 'FairScale Agent Registry',
-    version: '14.0.0',
+    version: '15.0.0',
     description: 'The Trust & Discovery Layer for Solana AI Agents',
     api: {
       v1: {
@@ -2675,21 +2681,159 @@ app.get('/beta/users', (req, res) => {
 });
 
 // =============================================================================
+// MERCHANT VERIFICATION SYSTEM
+// =============================================================================
+// Merchants apply → Admin reviews → Verified merchants get listed and become
+// eligible for agent spend via x402 lending platform.
+
+const MERCHANTS = {
+  applications: new Map(),  // id → { ...application, status: 'pending'|'approved'|'rejected' }
+  verified: new Map(),      // id → { ...merchant, verifiedAt, banner, profileImage }
+};
+
+// Merchant application (public — anyone can apply)
+app.post('/merchants/apply', (req, res) => {
+  const { business_name, wallet, website, x_handle, contact_email, description, category, services_offered } = req.body;
+  if (!business_name || !wallet || !contact_email) return res.status(400).json({ error: 'Missing required fields: business_name, wallet, contact_email' });
+  if (wallet.length < 32 || wallet.length > 44) return res.status(400).json({ error: 'Invalid Solana wallet address' });
+
+  const id = `merch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const application = {
+    id, business_name, wallet, website: website || null, x_handle: x_handle || null,
+    contact_email, description: description || null, category: category || 'general',
+    services_offered: services_offered || [], status: 'pending',
+    applied_at: new Date().toISOString(), reviewed_at: null, reviewed_by: null,
+    banner_url: null, profile_image_url: null, notes: null,
+  };
+  MERCHANTS.applications.set(id, application);
+  console.log(`[Merchant] New application: ${business_name} (${wallet.slice(0,8)}...)`);
+  res.json({ success: true, id, message: 'Application submitted. We will review and get back to you.' });
+});
+
+// Admin: list all applications
+app.get('/merchants/admin/applications', (req, res) => {
+  const { key, status } = req.query;
+  if (key !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  let apps = Array.from(MERCHANTS.applications.values());
+  if (status) apps = apps.filter(a => a.status === status);
+  apps.sort((a, b) => new Date(b.applied_at) - new Date(a.applied_at));
+  res.json({ total: apps.length, applications: apps });
+});
+
+// Admin: review an application (approve/reject + fill in details)
+app.post('/merchants/admin/review', (req, res) => {
+  const { key, id, decision, business_name, description, category, website, x_handle,
+    banner_url, profile_image_url, services_offered, notes, payment_tier } = req.body;
+  if (key !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  if (!id || !decision) return res.status(400).json({ error: 'Missing id or decision' });
+  if (!['approved', 'rejected'].includes(decision)) return res.status(400).json({ error: 'Decision must be approved or rejected' });
+
+  const app = MERCHANTS.applications.get(id);
+  if (!app) return res.status(404).json({ error: 'Application not found' });
+
+  app.status = decision;
+  app.reviewed_at = new Date().toISOString();
+  app.reviewed_by = 'admin';
+  if (notes) app.notes = notes;
+
+  if (decision === 'approved') {
+    // Admin can override/fill in merchant details
+    const merchant = {
+      id: app.id, wallet: app.wallet,
+      business_name: business_name || app.business_name,
+      description: description || app.description,
+      category: category || app.category,
+      website: website || app.website,
+      x_handle: x_handle || app.x_handle,
+      contact_email: app.contact_email,
+      banner_url: banner_url || app.banner_url || null,
+      profile_image_url: profile_image_url || app.profile_image_url || null,
+      services_offered: services_offered || app.services_offered || [],
+      payment_tier: payment_tier || 'standard', // standard, premium, enterprise
+      verified_at: new Date().toISOString(),
+      applied_at: app.applied_at,
+      fairscore: null, // Will be populated on first directory load
+    };
+    MERCHANTS.verified.set(id, merchant);
+    // Also score their wallet
+    getOrCreateAgent(app.wallet).then(agent => {
+      if (agent) merchant.fairscore = agent.scores.agent_fairscore;
+    }).catch(() => {});
+    console.log(`[Merchant] APPROVED: ${merchant.business_name} (${app.wallet.slice(0,8)}...)`);
+  } else {
+    console.log(`[Merchant] REJECTED: ${app.business_name} (${app.wallet.slice(0,8)}...) — ${notes || 'no reason'}`);
+  }
+  res.json({ success: true, id, decision, merchant: MERCHANTS.verified.get(id) || null });
+});
+
+// Admin: update a verified merchant (images, details)
+app.post('/merchants/admin/update', (req, res) => {
+  const { key, id, ...updates } = req.body;
+  if (key !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  const merchant = MERCHANTS.verified.get(id);
+  if (!merchant) return res.status(404).json({ error: 'Merchant not found' });
+  const allowed = ['business_name', 'description', 'category', 'website', 'x_handle', 'banner_url', 'profile_image_url', 'services_offered', 'payment_tier', 'notes'];
+  for (const [k, v] of Object.entries(updates)) {
+    if (allowed.includes(k)) merchant[k] = v;
+  }
+  merchant.updated_at = new Date().toISOString();
+  res.json({ success: true, merchant });
+});
+
+// Admin: remove a merchant
+app.post('/merchants/admin/remove', (req, res) => {
+  const { key, id } = req.body;
+  if (key !== CONFIG.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  const deleted = MERCHANTS.verified.delete(id);
+  if (deleted) {
+    const app = MERCHANTS.applications.get(id);
+    if (app) app.status = 'removed';
+  }
+  res.json({ success: true, deleted });
+});
+
+// Public: list verified merchants
+app.get('/merchants', (req, res) => {
+  const { category } = req.query;
+  let merchants = Array.from(MERCHANTS.verified.values());
+  if (category) merchants = merchants.filter(m => m.category === category);
+  merchants.sort((a, b) => (b.fairscore || 0) - (a.fairscore || 0));
+  res.json({
+    total: merchants.length,
+    merchants: merchants.map(m => ({
+      id: m.id, business_name: m.business_name, wallet: m.wallet,
+      description: m.description, category: m.category,
+      website: m.website, x_handle: m.x_handle,
+      banner_url: m.banner_url, profile_image_url: m.profile_image_url,
+      services_offered: m.services_offered, payment_tier: m.payment_tier,
+      fairscore: m.fairscore, verified_at: m.verified_at,
+    })),
+  });
+});
+
+// Public: get single merchant
+app.get('/merchants/:id', (req, res) => {
+  const merchant = MERCHANTS.verified.get(req.params.id);
+  if (!merchant) return res.status(404).json({ error: 'Merchant not found' });
+  res.json({ merchant });
+});
+
+// =============================================================================
 // START
 // =============================================================================
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`FairScale Registry v14.0 on port ${CONFIG.PORT}`);
+  console.log(`FairScale Registry v15.0 on port ${CONFIG.PORT}`);
   console.log(`  Integrations: FairScale API, SAID Protocol, ERC-8004, SATI, SAS, ClawKey, Kamiyo`);
-  console.log(`  Features: Attestation Graph, Score History, Task Profiles, Trust Gate`);
+  console.log(`  Features: Attestation Graph (v2 deduped), Score History, Task Profiles, Trust Gate, Merchant Verification`);
   setTimeout(syncFromSAID, 5000);
   setTimeout(syncFrom8004, 15000);
   setTimeout(syncFromSATI, 30000);
-  setTimeout(syncKamiyo, 60000); // Start Kamiyo after 60s (agents being scored by then)
+  setTimeout(syncKamiyo, 60000);
   setInterval(syncFromSAID, 24 * 60 * 60 * 1000);
   setInterval(syncFrom8004, 6 * 60 * 60 * 1000);
   setInterval(syncFromSATI, 6 * 60 * 60 * 1000);
-  setInterval(syncKamiyo, 3 * 60 * 60 * 1000); // Re-sync Kamiyo every 3h
+  setInterval(syncKamiyo, 3 * 60 * 60 * 1000);
 });
 
 // Kamiyo batch sync — lightweight check for all scored agents
