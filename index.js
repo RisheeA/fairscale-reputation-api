@@ -659,16 +659,25 @@ async function syncFromSATI() {
         const feedbacks = fdata.feedbacks || [];
 
         if (feedbacks.length > 0) {
-          const attesters = feedbacks.map(fb => ({
-            wallet: fb.clientAddress || 'sati_reviewer',
-            score: fb.value != null ? Math.min(fb.value, 100) : null, // Cap at 100, null if unknown
-            timestamp: fb.createdAt ? new Date(fb.createdAt * 1000).toISOString() : null,
-            type: 'sati_feedback',
-            tag: fb.tag1 || null,
-            outcome: fb.outcome,
-            message: fb.message || null,
-            _dedup_key: fb.clientAddress ? `sati_${fb.clientAddress}_${mint}` : `sati_anon_${fb.createdAt}_${mint}`,
-          }));
+          const attesters = feedbacks.map(fb => {
+            const attesterWallet = fb.clientAddress || 'sati_reviewer';
+            // Use the attester's FairScore from our registry if available (much more meaningful than fb.value)
+            const attesterAgent = REGISTRY.agents.get(attesterWallet);
+            const attesterFairScore = attesterAgent?.scores?.agent_fairscore || null;
+            const feedbackValue = fb.value != null && fb.value > 0 ? Math.min(fb.value, 100) : null;
+            // Prefer the attester's own FairScore; fall back to feedback value
+            const score = attesterFairScore || feedbackValue || null;
+            return {
+              wallet: attesterWallet,
+              score,
+              timestamp: fb.createdAt ? new Date(fb.createdAt * 1000).toISOString() : null,
+              type: 'sati_feedback',
+              tag: fb.tag1 || null,
+              outcome: fb.outcome,
+              message: fb.message || null,
+              _dedup_key: fb.clientAddress ? `sati_${fb.clientAddress}_${mint}` : `sati_anon_${fb.createdAt}_${mint}`,
+            };
+          });
 
           // DEDUP: merge with existing but never duplicate by _dedup_key
           const existing = REGISTRY.attestationGraph.get(agent.wallet);
@@ -685,7 +694,7 @@ async function syncFromSATI() {
             }
           }
           const deduped = Array.from(byWallet.values());
-          const sa = deduped.filter(a => a.score != null);
+          const sa = deduped.filter(a => a.score != null && a.score > 0);
 
           REGISTRY.attestationGraph.set(agent.wallet, {
             attesters: deduped,
@@ -2101,26 +2110,19 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
     lastUpdated: new Date().toISOString(),
   };
 
-  // Async: scan counterparties + discover funder in background
+  // Async: scan counterparties + discover funder in background (DISPLAY ONLY — no score mutations)
   scanCounterparties(wallet).then(cp => {
     if (cp && agent) {
       agent.counterparties = cp;
-      applyCounterpartyBoost(agent);
+      // Don't mutate scores — counterparty data is informational only
     }
   }).catch(() => {});
 
   discoverFundingWallet(wallet).then(funder => {
     if (funder && agent) {
       agent.funder = funder;
-      // Apply funder score impact to the agent
-      if (funder.relationship === 'low_trust') {
-        // Low-trust funder: slight negative impact
-        agent.scores.agent_fairscore = Math.max(agent.scores.agent_fairscore - 3, 5);
-        agent.red_flags = [...(agent.red_flags || []), 'low_trust_funder'];
-      } else if (funder.relationship === 'high_trust') {
-        // High-trust funder: slight positive
-        agent.scores.agent_fairscore = Math.min(agent.scores.agent_fairscore + 2, 100);
-      }
+      // Don't mutate scores — funder data is informational only
+      // Funder trust relationship is displayed in the profile but doesn't change the score
     }
   }).catch(() => {});
 
