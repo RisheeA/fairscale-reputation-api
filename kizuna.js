@@ -47,6 +47,10 @@ const KIZUNA_EVENT_TYPES = new Set([
   'dispute_lost',
   'merchant_verified',
   'identity_verified',
+  // Collateral and refund events (Kamiyo enforcement feedback)
+  'collateral_deposited',
+  'collateral_withdrawn',
+  'refund_issued',
 ]);
 
 const RISK_BANDS = {
