@@ -525,25 +525,40 @@ function buildDecisionEnvelope(params) {
 }
 
 function generateDecisionSignature(params) {
-  // MVP: HMAC-like signature using ADMIN_KEY as secret
-  // Production: Ed25519 keypair signing
-  const payload = JSON.stringify({
+  // HMAC-SHA256 signing for decision envelopes
+  // Canonical payload: sorted JSON keys, deterministic
+  const canonical = JSON.stringify({
+    agentId: params.agentId,
     approved: params.approved,
     approvedAmount: params.approvedAmount,
     fairScore: params.fairScore,
     nonce: params.nonce,
-    agentId: params.agentId,
-    issuedAt: new Date().toISOString(),
   });
-  // Simple hash for MVP — NOT cryptographically secure
-  // Replace with proper Ed25519 signing in production
-  let hash = 0;
-  for (let i = 0; i < payload.length; i++) {
-    const char = payload.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash; // Convert to 32bit
-  }
-  return `fsig_mvp_${Math.abs(hash).toString(36)}_${Date.now().toString(36)}`;
+  return hmacSign(canonical);
+}
+
+// HMAC-SHA256 using Node crypto (available globally in Node 18+)
+import { createHmac } from 'crypto';
+
+function hmacSign(payload) {
+  const secret = KIZUNA._config?.ADMIN_KEY || 'fairscale-kizuna-mvp';
+  const hmac = createHmac('sha256', secret);
+  hmac.update(payload);
+  return 'fsig_hmac256_' + hmac.digest('hex');
+}
+
+// Verify an incoming event's HMAC signature from Kamiyo
+// Canonical format: JSON.stringify with SORTED keys of { entityId, eventId, timestamp, type }
+function verifyEventSignature(event) {
+  if (!event.signature) return false;
+  const canonical = JSON.stringify({
+    entityId: event.entityId,
+    eventId: event.eventId,
+    timestamp: event.timestamp,
+    type: event.type,
+  });
+  const expected = hmacSign(canonical);
+  return event.signature === expected;
 }
 
 // ---------------------------------------------------------------------------
@@ -629,11 +644,9 @@ function loadKizunaState(state) {
 
 function registerKizunaRoutes(app, CONFIG, registry) {
 
-  // Make REGISTRY available to scoring functions
-  if (registry) {
-    // Store reference for use in calculateKizunaFairScore
-    KIZUNA._registry = registry;
-  }
+  // Make REGISTRY and CONFIG available to scoring/signing functions
+  if (registry) KIZUNA._registry = registry;
+  if (CONFIG) KIZUNA._config = CONFIG;
 
   // --- Middleware: Kamiyo auth for write endpoints ---
   const kizunaAuth = (req, res, next) => {
@@ -816,6 +829,22 @@ function registerKizunaRoutes(app, CONFIG, registry) {
         enterprise: { type: 'prefund', minScore: 25 },
         crypto_fast: { type: 'collateral', minHealthFactor: 1.25, minScore: 20 },
       },
+      signing: {
+        algorithm: 'HMAC-SHA256',
+        header: 'x-kizuna-key (shared secret for auth)',
+        eventSignatureFormat: {
+          description: 'HMAC-SHA256 of canonical JSON payload using shared secret',
+          canonicalPayload: 'JSON.stringify({ entityId, eventId, timestamp, type }) — keys MUST be sorted alphabetically',
+          output: 'fsig_hmac256_<hex digest>',
+          example: 'Compute HMAC-SHA256(secret, \'{"entityId":"WALLET","eventId":"evt_1","timestamp":"2026-03-09T14:00:00.000Z","type":"repayment_received"}\') and prefix with fsig_hmac256_',
+        },
+        decisionSignatureFormat: {
+          description: 'FairScale signs decision envelopes with HMAC-SHA256',
+          canonicalPayload: 'JSON.stringify({ agentId, approved, approvedAmount, fairScore, nonce }) — keys sorted alphabetically',
+          output: 'fsig_hmac256_<hex digest>',
+        },
+        note: 'For staging, event signature verification is optional (x-kizuna-key auth is sufficient). Start generating HMAC signatures now — we will enforce verification in production.',
+      },
     });
   });
 
@@ -833,6 +862,8 @@ export {
   evaluateDecision,
   getReliabilitySummary,
   getEntityEvents,
+  verifyEventSignature,
+  hmacSign,
   KIZUNA_EVENT_TYPES,
   RISK_BANDS,
   REASON_CODES,
