@@ -492,7 +492,7 @@ async function syncFrom8004() {
         if (agent.wallet) {
           const existing = REGISTRY.agents.get(agent.wallet);
           const tag = { assetId: agent.assetId, name: agent.name, services: agent.services, skills: agent.skills };
-          if (!existing || Date.now() - new Date(existing.lastUpdated).getTime() > 600000) {
+          if (!existing) {
             let saidVerify = null;
             if (REGISTRY.saidAgents.has(agent.wallet)) {
               try { const r = await fetch(`${CONFIG.SAID_API}/api/verify/${agent.wallet}`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(2000) }); if (r.ok) saidVerify = await r.json(); } catch(e) {}
@@ -1959,9 +1959,10 @@ function getRecommendationTier(score, verifications, wallet) {
 // =============================================================================
 
 async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
-  if (REGISTRY.agents.has(wallet)) {
-    const cached = REGISTRY.agents.get(wallet);
-    if (Date.now() - new Date(cached.lastUpdated).getTime() < 1800000) return cached;
+  const existingAgent = REGISTRY.agents.get(wallet);
+  if (existingAgent) {
+    // Cache for 24 hours — FairScale model retrains daily, scores should not fluctuate within a day
+    if (Date.now() - new Date(existingAgent.lastUpdated).getTime() < 24 * 60 * 60 * 1000) return existingAgent;
   }
 
   const regData = REGISTRY.registeredAgents.get(wallet);
@@ -1990,9 +1991,15 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
   }
   const socialHandle = saidHandle || knownHandle;
 
+  // CRITICAL: If FairScale API failed but we already have a scored agent,
+  // KEEP the existing score. Never downgrade due to API failure.
+  if (!fairscaleData && existingAgent) {
+    // API failed — return existing agent, don't re-score with null data
+    return existingAgent;
+  }
+
   if (!fairscaleData && !saidData) {
     // Both APIs returned null — wallet exists on-chain but has no scoreable data.
-    // Skip quietly. These wallets will be scored when FairScale API picks up their activity.
     return null;
   }
 
@@ -2125,6 +2132,28 @@ async function getOrCreateAgent(wallet, prefetchedSaidData = undefined) {
       // Funder trust relationship is displayed in the profile but doesn't change the score
     }
   }).catch(() => {});
+
+  // SCORE PROTECTION: Never allow a dramatic score drop from API variance.
+  // If the new score is 15+ points lower than existing AND there are no new
+  // red flags or defaults to justify it, keep the existing score.
+  // This prevents API rate-limiting or timing variance from tanking scores.
+  if (existingAgent && existingAgent.scores?.agent_fairscore) {
+    const oldScore = existingAgent.scores.agent_fairscore;
+    const newScore = agent.scores.agent_fairscore;
+    const scoreDrop = oldScore - newScore;
+    const hasNewFlags = (agent.red_flags || []).length > (existingAgent.red_flags || []).length;
+    const hasDefault = (agent.red_flags || []).some(f => f.includes('credit_default'));
+
+    if (scoreDrop >= 15 && !hasNewFlags && !hasDefault) {
+      // Suspicious drop with no new evidence — keep existing score, update metadata only
+      agent.scores.agent_fairscore = oldScore;
+      agent.recommendation = existingAgent.recommendation;
+      console.log(`[Score Protection] ${wallet.slice(0,8)}: blocked drop ${oldScore} → ${newScore} (no new flags). Keeping ${oldScore}.`);
+    }
+    // Carry over counterparties and funder from previous if available
+    if (existingAgent.counterparties && !agent.counterparties) agent.counterparties = existingAgent.counterparties;
+    if (existingAgent.funder && !agent.funder) agent.funder = existingAgent.funder;
+  }
 
   REGISTRY.agents.set(wallet, agent);
   return agent;
